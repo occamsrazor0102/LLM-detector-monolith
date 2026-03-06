@@ -75,55 +75,87 @@ HAS_SEMANTIC = False
 _EMBEDDER = None
 _AI_CENTROIDS = None
 _HUMAN_CENTROIDS = None
+_SEMANTIC_INIT_LOCK = threading.Lock()
+_SEMANTIC_INIT_DONE = False
+
+_AI_ARCHETYPES = [
+    "As an AI language model, I cannot provide personal opinions.",
+    "Here is a comprehensive breakdown of the key factors to consider.",
+    "To address this challenge, we must consider multiple perspectives.",
+    "This thorough analysis demonstrates the critical importance of the topic.",
+    "Furthermore, it is essential to note that this approach ensures alignment.",
+    "In conclusion, by leveraging these strategies we can achieve optimal results.",
+]
+_HUMAN_ARCHETYPES = [
+    "honestly idk maybe try restarting it lol",
+    "so I went ahead and just hacked together a quick script",
+    "tbh the whole thing is kinda janky but it works",
+    "yeah no that's totally wrong, here's what actually happened",
+    "I messed around with it for a bit and got something working",
+]
 
 try:
     from sentence_transformers import SentenceTransformer
     from sklearn.metrics.pairwise import cosine_similarity as _cosine_similarity
     import numpy as np
-
-    _EMBEDDER = SentenceTransformer('all-MiniLM-L6-v2')
-
-    _AI_ARCHETYPES = [
-        "As an AI language model, I cannot provide personal opinions.",
-        "Here is a comprehensive breakdown of the key factors to consider.",
-        "To address this challenge, we must consider multiple perspectives.",
-        "This thorough analysis demonstrates the critical importance of the topic.",
-        "Furthermore, it is essential to note that this approach ensures alignment.",
-        "In conclusion, by leveraging these strategies we can achieve optimal results.",
-    ]
-    _HUMAN_ARCHETYPES = [
-        "honestly idk maybe try restarting it lol",
-        "so I went ahead and just hacked together a quick script",
-        "tbh the whole thing is kinda janky but it works",
-        "yeah no that's totally wrong, here's what actually happened",
-        "I messed around with it for a bit and got something working",
-    ]
-    _AI_CENTROIDS = _EMBEDDER.encode(_AI_ARCHETYPES)
-    _HUMAN_CENTROIDS = _EMBEDDER.encode(_HUMAN_ARCHETYPES)
     HAS_SEMANTIC = True
 except ImportError:
     pass
 except Exception as e:
     print(f"INFO: sentence-transformers setup failed ({e}). Semantic layer disabled.")
 
+
+def _ensure_semantic():
+    """Lazy-initialize sentence-transformers model on first use."""
+    global _EMBEDDER, _AI_CENTROIDS, _HUMAN_CENTROIDS, _SEMANTIC_INIT_DONE, HAS_SEMANTIC
+    if _SEMANTIC_INIT_DONE or not HAS_SEMANTIC:
+        return
+    with _SEMANTIC_INIT_LOCK:
+        if _SEMANTIC_INIT_DONE:
+            return
+        try:
+            _EMBEDDER = SentenceTransformer('all-MiniLM-L6-v2')
+            _AI_CENTROIDS = _EMBEDDER.encode(_AI_ARCHETYPES)
+            _HUMAN_CENTROIDS = _EMBEDDER.encode(_HUMAN_ARCHETYPES)
+        except Exception as e:
+            HAS_SEMANTIC = False
+            print(f"INFO: sentence-transformers model loading failed ({e}). Semantic layer disabled.")
+        _SEMANTIC_INIT_DONE = True
+
 # ── transformers: local perplexity scoring ──────────────────────────────────
 HAS_PERPLEXITY = False
 _PPL_MODEL = None
 _PPL_TOKENIZER = None
+_PPL_INIT_LOCK = threading.Lock()
+_PPL_INIT_DONE = False
 
 try:
     from transformers import GPT2LMHeadModel, GPT2TokenizerFast
     import torch as _torch
-
-    _PPL_MODEL_ID = 'distilgpt2'
-    _PPL_MODEL = GPT2LMHeadModel.from_pretrained(_PPL_MODEL_ID)
-    _PPL_TOKENIZER = GPT2TokenizerFast.from_pretrained(_PPL_MODEL_ID)
-    _PPL_MODEL.eval()
     HAS_PERPLEXITY = True
 except ImportError:
     pass
 except Exception as e:
-    print(f"INFO: transformers/torch setup failed ({e}). Perplexity scoring disabled.")
+    print(f"INFO: transformers/torch import failed ({e}). Perplexity scoring disabled.")
+
+
+def _ensure_perplexity():
+    """Lazy-initialize distilgpt2 model on first use."""
+    global _PPL_MODEL, _PPL_TOKENIZER, _PPL_INIT_DONE, HAS_PERPLEXITY
+    if _PPL_INIT_DONE or not HAS_PERPLEXITY:
+        return
+    with _PPL_INIT_LOCK:
+        if _PPL_INIT_DONE:
+            return
+        try:
+            _PPL_MODEL_ID = 'distilgpt2'
+            _PPL_MODEL = GPT2LMHeadModel.from_pretrained(_PPL_MODEL_ID)
+            _PPL_TOKENIZER = GPT2TokenizerFast.from_pretrained(_PPL_MODEL_ID)
+            _PPL_MODEL.eval()
+        except Exception as e:
+            HAS_PERPLEXITY = False
+            print(f"INFO: distilgpt2 model loading failed ({e}). Perplexity scoring disabled.")
+        _PPL_INIT_DONE = True
 
 # ── pypdf: PDF text extraction ──────────────────────────────────────────────
 try:
@@ -566,7 +598,7 @@ def apply_calibration(confidence, cal_table, domain=None, length_bin=None):
         return {
             'raw_confidence': confidence,
             'calibrated_confidence': confidence,
-            'p_value': None,
+            'confidence_quantile': None,
             'stratum_used': 'uncalibrated',
         }
 
@@ -581,13 +613,13 @@ def apply_calibration(confidence, cal_table, domain=None, length_bin=None):
         stratum_label = 'global'
 
     if nc_score <= cal.get(0.01, 0):
-        p_value = 1.0
+        confidence_quantile = 1.0
     elif nc_score <= cal.get(0.05, 0):
-        p_value = 0.10
+        confidence_quantile = 0.10
     elif nc_score <= cal.get(0.10, 0):
-        p_value = 0.05
+        confidence_quantile = 0.05
     else:
-        p_value = 0.01
+        confidence_quantile = 0.01
 
     alpha_05 = cal.get(0.05, 0.5)
     if nc_score > alpha_05:
@@ -600,7 +632,7 @@ def apply_calibration(confidence, cal_table, domain=None, length_bin=None):
     return {
         'raw_confidence': round(confidence, 4),
         'calibrated_confidence': round(calibrated, 4),
-        'p_value': round(p_value, 4) if p_value is not None else None,
+        'confidence_quantile': round(confidence_quantile, 4) if confidence_quantile is not None else None,
         'stratum_used': stratum_label,
     }
 
@@ -662,7 +694,7 @@ _BASELINE_FIELDS = [
     'window_max_score', 'window_mean_score', 'window_variance',
     'window_hot_span', 'window_mixed_signal',
     'stylo_fw_ratio', 'stylo_sent_dispersion', 'stylo_ttr',
-    'calibrated_confidence', 'p_value', 'calibration_stratum',
+    'calibrated_confidence', 'confidence_quantile', 'calibration_stratum',
     'pack_constraint_score', 'pack_exec_spec_score', 'pack_schema_score',
     'pack_active_families', 'pack_prompt_boost', 'pack_idi_boost',
 ]
@@ -1269,6 +1301,7 @@ def run_semantic_resonance(text):
 
     Returns dict with semantic scores, delta, determination, and confidence.
     """
+    _ensure_semantic()
     if not HAS_SEMANTIC:
         return {
             'semantic_ai_score': 0.0,
@@ -2057,6 +2090,7 @@ def run_perplexity(text):
 
     Returns dict with perplexity, determination, and confidence.
     """
+    _ensure_perplexity()
     _ppl_empty = {
         'perplexity': 0.0, 'determination': None, 'confidence': 0.0,
         'surprisal_variance': 0.0, 'first_half_variance': 0.0,
@@ -3286,9 +3320,6 @@ Usage:
     result = run_prompt_signature_enhanced(text)
 """
 
-_HAS_ANALYZERS = True
-
-
 def run_prompt_signature_enhanced(text: str, base_result: Optional[dict] = None) -> dict:
     """Enhanced prompt_signature with lexicon pack integration.
 
@@ -3297,17 +3328,11 @@ def run_prompt_signature_enhanced(text: str, base_result: Optional[dict] = None)
     (exec-spec/rubric/Gherkin) packs.
     """
     if base_result is None:
-        if not _HAS_ANALYZERS:
-            raise ImportError("llm_detector.analyzers required for base prompt_signature")
         base_result = run_prompt_signature(text)
 
     sents = base_result.get('_sentences', None)
     if sents is None:
-        if _HAS_ANALYZERS:
-            sents = get_sentences(text)
-        else:
-            sents = re.split(r'(?<=[.!?])\s+(?=[A-Z"\'])', text)
-            sents = [s for s in sents if s.strip()]
+        sents = get_sentences(text)
     n_sents = max(len(sents), 1)
 
     constraint_names = [n for n in get_packs_for_layer('prompt_signature')
@@ -3381,8 +3406,6 @@ def run_prompt_signature_enhanced(text: str, base_result: Optional[dict] = None)
 def run_voice_dissonance_enhanced(text: str, base_result: Optional[dict] = None) -> dict:
     """Enhanced voice_dissonance with schema/structured-output vocabulary."""
     if base_result is None:
-        if not _HAS_ANALYZERS:
-            raise ImportError("llm_detector.analyzers required for base voice_dissonance")
         base_result = run_voice_dissonance(text)
 
     words = text.split()
@@ -3448,8 +3471,6 @@ def run_instruction_density_enhanced(text: str, base_result: Optional[dict] = No
                                      schema_active: bool = False) -> dict:
     """Enhanced instruction_density with typed task-verb and value-domain operators."""
     if base_result is None:
-        if not _HAS_ANALYZERS:
-            raise ImportError("llm_detector.analyzers required for base instruction_density")
         base_result = run_instruction_density(text)
 
     words = text.split()
@@ -3933,8 +3954,17 @@ def determine(preamble_score, preamble_severity, prompt_sig, voice_dis,
     ch_window = score_windowed(window_result=kwargs.get('window_result'))
 
     channels = [ch_prompt, ch_style, ch_cont, ch_window]
+
+    # Detect channel disagreement: any channel at AMBER+ while another is GREEN
+    active_sevs = [ch.severity for ch in channels if ch.severity != 'GREEN']
+    green_count = sum(1 for ch in channels if ch.severity == 'GREEN')
+    has_strong = any(ch.sev_level >= 2 for ch in channels)
+    disagreement = has_strong and green_count >= 2
+    agreement_label = 'DISAGREE' if disagreement else 'AGREE'
+
     channel_details = {
         'mode': mode,
+        'channel_agreement': agreement_label,
         'channels': {ch.channel: {
             'score': ch.score, 'severity': ch.severity,
             'explanation': ch.explanation, 'mode_eligible': mode in ch.mode_eligibility,
@@ -4002,7 +4032,10 @@ def determine(preamble_score, preamble_severity, prompt_sig, voice_dis,
         return det, reason, conf, channel_details
 
     if mode == 'task_prompt' and n_primary_red >= 1 and n_yellow_plus == 1:
-        det, reason, conf = _apply_cap('AMBER', f"{combined_reason} [single-channel, demoted from RED]", min(top_score, 0.75))
+        demote_tag = '[single-channel, demoted from RED]'
+        if disagreement:
+            demote_tag = '[single-channel, demoted from RED, channels disagree]'
+        det, reason, conf = _apply_cap('AMBER', f"{combined_reason} {demote_tag}", min(top_score, 0.75))
         return det, reason, conf, channel_details
 
     if mode == 'generic_aigt' and n_red >= 1:
@@ -4053,7 +4086,10 @@ def determine(preamble_score, preamble_severity, prompt_sig, voice_dis,
     any_signal = any(ch.score > 0.05 for ch in channels)
     if any_signal:
         weak_parts = [ch.explanation for ch in channels if ch.score > 0.05]
-        return 'REVIEW', f"Weak signals below threshold: {' + '.join(weak_parts[:2])}", 0.10, channel_details
+        review_reason = f"Weak signals below threshold: {' + '.join(weak_parts[:2])}"
+        if disagreement:
+            review_reason += ' [channels disagree]'
+        return 'REVIEW', review_reason, 0.10, channel_details
 
     # GREEN
     return 'GREEN', 'No significant signals', 0.0, channel_details
@@ -4168,7 +4204,7 @@ def analyze_prompt(text, task_id='', occupation='', attempter='', stage='',
         'reason': reason,
         'confidence': confidence,
         'calibrated_confidence': cal_result['calibrated_confidence'],
-        'p_value': cal_result['p_value'],
+        'confidence_quantile': cal_result['confidence_quantile'],
         'calibration_stratum': cal_result['stratum_used'],
         'mode': channel_details.get('mode', mode),
         'channel_details': channel_details,
@@ -4359,11 +4395,11 @@ def print_result(r, verbose=False):
     print(f"     Reason: {r['reason']}")
 
     cal_conf = r.get('calibrated_confidence')
-    p_val = r.get('p_value')
+    cq_val = r.get('confidence_quantile')
     if cal_conf is not None and cal_conf != r.get('confidence'):
         cal_str = f"     Calibrated: conf={cal_conf:.3f}"
-        if p_val is not None:
-            cal_str += f"  p={p_val:.3f}"
+        if cq_val is not None:
+            cal_str += f"  q={cq_val:.3f}"
         cal_str += f"  [{r.get('calibration_stratum', '?')}]"
         print(cal_str)
 

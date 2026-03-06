@@ -14,29 +14,31 @@ The pipeline analyzes text across multiple independent layers, each targeting a 
 
 ### Detection Layers
 
-| Layer | Module | Description |
-|-------|--------|-------------|
-| **Preamble** | `analyzers/preamble.py` | Catches LLM output artifacts: assistant acknowledgments, artifact delivery frames, first-person creation claims, meta-design language |
-| **Fingerprint** | `analyzers/fingerprint.py` | 120-word tiered lexicon of LLM-preferred vocabulary (diagnostic only, not standalone trigger) |
-| **Prompt Signature** | `analyzers/prompt_signature.py` | Structural patterns of LLM-generated prompts: Constraint Frame Density, Must-Frame Saturation Rate, meta-evaluation design language |
-| **Voice Dissonance** | `analyzers/voice_dissonance.py` | Measures contradiction between casual voice markers and technical specification density |
-| **Instruction Density** | `analyzers/instruction_density.py` | Counts formal-exhaustive specification patterns: imperatives, conditionals, binary specs |
-| **Semantic Resonance** | `analyzers/semantic_resonance.py` | Cosine similarity of sentence embeddings against AI/human archetype centroids |
-| **Self-Similarity** | `analyzers/self_similarity.py` | N-gram Self-Similarity Index (NSSI) for detecting formulaic LLM patterns |
-| **Continuation (API)** | `analyzers/continuation_api.py` | DNA-GPT divergent continuation analysis via Anthropic/OpenAI API |
-| **Continuation (Local)** | `analyzers/continuation_local.py` | Zero-LLM DNA-GPT proxy using backoff n-gram language model |
-| **Perplexity** | `analyzers/perplexity.py` | distilgpt2-based perplexity scoring |
+All detection logic lives in `llm_detector_monolith.py`:
+
+| Layer | Description |
+|-------|-------------|
+| **Preamble** | Catches LLM output artifacts: assistant acknowledgments, artifact delivery frames, first-person creation claims, meta-design language, chain-of-thought leakage (`<think>` tags, reasoning-model self-correction phrases) |
+| **Fingerprint** | 120-word tiered lexicon of LLM-preferred vocabulary (diagnostic only, not standalone trigger) |
+| **Prompt Signature** | Structural patterns of LLM-generated prompts: Constraint Frame Density, Must-Frame Saturation Rate, meta-evaluation design language |
+| **Voice Dissonance** | Measures contradiction between casual voice markers and technical specification density |
+| **Instruction Density** | Counts formal-exhaustive specification patterns: imperatives, conditionals, binary specs |
+| **Semantic Resonance** | Cosine similarity of sentence embeddings against AI/human archetype centroids |
+| **Self-Similarity** | N-gram Self-Similarity Index (NSSI) for detecting formulaic LLM patterns |
+| **Continuation (API)** | DNA-GPT divergent continuation analysis via Anthropic/OpenAI API |
+| **Continuation (Local)** | Zero-LLM DNA-GPT proxy using backoff n-gram language model |
+| **Perplexity** | distilgpt2-based perplexity scoring with DivEye-inspired surprisal variance and volatility decay analysis |
 
 ### Scoring Channels
 
 Signals are organized into four independent scoring channels:
 
-| Channel | Module | Primary Layers |
-|---------|--------|----------------|
-| **Prompt Structure** | `channels/prompt_structure.py` | Preamble, Prompt Signature, Voice Dissonance, Instruction Density |
-| **Stylometric** | `channels/stylometric.py` | Self-Similarity, Semantic Resonance, Perplexity, Fingerprint |
-| **Continuation** | `channels/continuation.py` | Continuation API or Continuation Local |
-| **Windowed** | `channels/windowed.py` | Sentence-window scoring |
+| Channel | Primary Layers |
+|---------|----------------|
+| **Prompt Structure** | Preamble, Prompt Signature, Voice Dissonance, Instruction Density |
+| **Stylometric** | Self-Similarity, Semantic Resonance, Perplexity (incl. surprisal variance/volatility decay), Fingerprint |
+| **Continuation** | Continuation API or Continuation Local |
+| **Windowed** | Sentence-window scoring |
 
 ### Determination Levels
 
@@ -47,51 +49,14 @@ Signals are organized into four independent scoring channels:
 | YELLOW | Minor signals or convergence pattern | Note for awareness, may be legitimate |
 | GREEN | No significant signals detected | Pass |
 
-## Package Structure
+## File Structure
 
 ```
-llm_detector/                  # Main package
-    __init__.py                # Version, public API re-exports
-    __main__.py                # python -m llm_detector entry point
-    compat.py                  # Feature flags (HAS_SPACY, HAS_FTFY, etc.)
-    text_utils.py              # Shared utilities
-    normalize.py               # Text normalization
-    language_gate.py           # Language/fairness support check
-    pipeline.py                # Full pipeline orchestration
-    fusion.py                  # Evidence fusion across channels
-    calibration.py             # Conformal calibration
-    baselines.py               # Baseline collection and analysis
-    similarity.py              # Cross-submission similarity
-    io.py                      # File I/O (XLSX, CSV, PDF)
-    cli.py                     # Command-line interface
-    gui.py                     # Desktop GUI
-
-    analyzers/                 # One module per detection layer
-        preamble.py
-        fingerprint.py
-        prompt_signature.py
-        voice_dissonance.py
-        instruction_density.py
-        semantic_resonance.py
-        self_similarity.py
-        continuation_api.py
-        continuation_local.py
-        perplexity.py
-        stylometry.py
-        windowing.py
-
-    channels/                  # Channel scoring
-        prompt_structure.py
-        stylometric.py
-        continuation.py
-        windowed.py
-
-    lexicon/                   # Externalized detection vocabulary
-        packs.py               # LexiconPack definitions & scoring engine
-        integration.py         # Enhanced layer wrappers
-
+llm_detector_monolith.py       # All detection logic in a single module
 tests/                         # Test suite
 run_detector                   # Thin CLI launcher
+pyproject.toml                 # Package metadata & dependencies
+llm_detector.spec              # PyInstaller build spec
 ```
 
 ## Installation
@@ -102,7 +67,7 @@ pip install openpyxl pandas
 pip install spacy
 # Optional (semantic resonance layer):
 pip install sentence-transformers scikit-learn
-# Optional (perplexity scoring):
+# Optional (perplexity scoring + surprisal variance):
 pip install transformers torch
 # Optional (robust Unicode normalization):
 pip install ftfy
@@ -117,7 +82,7 @@ pip install anthropic  # or: pip install openai
 ### Single Text Analysis
 
 ```bash
-python -m llm_detector --text "Your prompt text here"
+python llm_detector_monolith.py --text "Your prompt text here"
 # or
 ./run_detector --text "Your prompt text here"
 ```
@@ -125,15 +90,15 @@ python -m llm_detector --text "Your prompt text here"
 ### Desktop GUI
 
 ```bash
-python -m llm_detector --gui
+python llm_detector_monolith.py --gui
 ```
 
 ### File Mode (XLSX/CSV/PDF)
 
 ```bash
-python -m llm_detector input.xlsx --sheet "Sheet1" --prompt-col "prompt"
-python -m llm_detector input.csv --prompt-col "content"
-python -m llm_detector document.pdf
+python llm_detector_monolith.py input.xlsx --sheet "Sheet1" --prompt-col "prompt"
+python llm_detector_monolith.py input.csv --prompt-col "content"
+python llm_detector_monolith.py document.pdf
 ```
 
 ### CLI Options
@@ -161,7 +126,7 @@ python -m llm_detector document.pdf
 ### Python API
 
 ```python
-from llm_detector import analyze_prompt
+from llm_detector_monolith import analyze_prompt
 
 result = analyze_prompt(
     text="You are a board-certified pharmacist. Analyze the following...",
@@ -180,8 +145,13 @@ print(result['voice_dissonance_vsd'])            # Voice-Specification Dissonanc
 print(result['prompt_signature_composite'])      # Prompt signature composite
 print(result['instruction_density_idi'])         # Instruction Density Index
 
+# Perplexity + surprisal variance (requires transformers + torch)
+print(result['perplexity_value'])                # Mean perplexity
+print(result['perplexity_surprisal_variance'])   # Token-level surprisal variance
+print(result['perplexity_volatility_decay'])     # First/second half variance ratio
+
 # Cross-submission similarity (batch mode)
-from llm_detector import analyze_similarity
+from llm_detector_monolith import analyze_similarity
 results = [analyze_prompt(t['prompt'], ...) for t in tasks]
 text_map = {r['task_id']: t['prompt'] for r, t in zip(results, tasks)}
 flags = analyze_similarity(results, text_map)
@@ -195,6 +165,9 @@ python tests/test_analyzers.py
 python tests/test_continuation_local.py
 python tests/test_fusion.py
 python tests/test_normalize.py
+python tests/test_calibration.py
+python tests/test_lexicon.py
+python tests/test_windowed.py
 ```
 
 ## Design Principles
@@ -206,6 +179,8 @@ python tests/test_normalize.py
 **Voice gate preserves specificity.** Voice Dissonance requires actual casual voice absence, not just specification presence. A human writing formal text naturally varies more than an LLM generating sterile specifications.
 
 **Diagnostic layers inform but don't trigger.** Fingerprint analysis participates in convergence and similarity analysis but doesn't fire standalone signals — the false positive rate on individual vocabulary items is too high.
+
+**Supporting signals support.** Perplexity, surprisal variance, and volatility decay act as supporting signals only — they boost confidence when other channels already fire, but never promote severity on their own.
 
 **Audit trail by default.** Every determination includes the primary signal, all supporting signals, and full layer-level diagnostics. Nothing is hidden from the reviewer.
 

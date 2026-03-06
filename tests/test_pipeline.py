@@ -79,7 +79,7 @@ def test_pipeline_v061():
     check("window fields", 'window_max_score' in r)
     check("stylo fields", 'stylo_fw_ratio' in r)
     check("calibrated_confidence", 'calibrated_confidence' in r)
-    check("p_value", 'p_value' in r)
+    check("confidence_quantile", 'confidence_quantile' in r)
     check("self_similarity fields", 'self_similarity_nssi_score' in r)
 
     # Channel structure
