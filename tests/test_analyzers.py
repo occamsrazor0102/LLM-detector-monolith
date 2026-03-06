@@ -4,9 +4,9 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from llm_detector.compat import HAS_SEMANTIC, HAS_PERPLEXITY
-from llm_detector.analyzers.semantic_resonance import run_semantic_resonance
-from llm_detector.analyzers.perplexity import run_perplexity
+from llm_detector_monolith import HAS_SEMANTIC, HAS_PERPLEXITY
+from llm_detector_monolith import run_semantic_resonance
+from llm_detector_monolith import run_perplexity
 from tests.conftest import AI_TEXT, HUMAN_TEXT, CLINICAL_TEXT
 
 PASSED = 0

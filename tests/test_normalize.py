@@ -4,8 +4,8 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from llm_detector.normalize import normalize_text
-from llm_detector.compat import HAS_FTFY
+from llm_detector_monolith import normalize_text
+from llm_detector_monolith import HAS_FTFY
 
 PASSED = 0
 FAILED = 0

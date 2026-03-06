@@ -4,8 +4,8 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from llm_detector.fusion import determine
-from llm_detector.channels.stylometric import score_stylometric
+from llm_detector_monolith import determine
+from llm_detector_monolith import score_stylometric
 
 PASSED = 0
 FAILED = 0
