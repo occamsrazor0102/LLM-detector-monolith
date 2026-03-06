@@ -65,7 +65,7 @@ def test_pipeline_v061():
 
     # Audit trail
     at = r.get('audit_trail', {})
-    check("audit_trail version is v0.61", at.get('pipeline_version') == 'v0.61',
+    check("audit_trail version is v0.65", at.get('pipeline_version') == 'v0.65',
           f"got {at.get('pipeline_version')}")
     check("audit_trail has semantic_available", 'semantic_available' in at)
     check("audit_trail has perplexity_available", 'perplexity_available' in at)
