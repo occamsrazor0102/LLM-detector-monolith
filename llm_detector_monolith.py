@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-LLM-Generated Task Prompt Detection Pipeline v0.61 -- Monolithic Build
-======================================================================
+LLM-Generated Task Prompt Detection Pipeline v0.61
+===================================================
 Multi-layer stylometric detection pipeline for identifying LLM-generated
 or LLM-assisted task prompts in human data collection workflows.
-
-This is a single-file consolidation of the llm_detector package.
-All modules have been merged into this file for easy distribution.
 """
 
 __version__ = '0.61.0'
@@ -141,7 +138,6 @@ except ImportError:
 # ==============================================================================
 """Shared text utilities used across multiple modules."""
 
-# (text_utils: uses HAS_SPACY and _nlp from compat section above)
 
 # Top-50 English function words (closed class, highly stable across registers)
 ENGLISH_FUNCTION_WORDS = frozenset([
@@ -179,7 +175,6 @@ Ref: MGTBench (He et al. 2023) — paraphrasing sensitivity in rule-based
      detectors.
 """
 
-# (normalize: uses HAS_FTFY and ftfy from compat section above)
 
 # Common homoglyph mappings: visually similar Unicode -> ASCII
 _HOMOGLYPH_MAP = str.maketrans({
@@ -295,7 +290,6 @@ Ref: Liang et al. (2023) "GPT Detectors Are Biased Against Non-Native
 Ref: Wang et al. (2023) "M4 -- multilingual detection remains harder."
 """
 
-# (language_gate: uses ENGLISH_FUNCTION_WORDS from text_utils section above)
 
 
 def check_language_support(text, word_count=None):
@@ -354,7 +348,6 @@ def check_language_support(text, word_count=None):
 # ==============================================================================
 """File loaders for xlsx, csv, and pdf input."""
 
-# (io: uses HAS_PYPDF and PdfReader from compat section above)
 
 
 def load_xlsx(filepath, sheet=None, prompt_col='prompt', id_col='task_id',
@@ -1014,7 +1007,6 @@ def run_fingerprint(text):
 # ==============================================================================
 """Prompt-engineering signature detection -- CFD, MFSR, numbered criteria."""
 
-# (prompt_signature: uses get_sentences from text_utils section above)
 
 CONSTRAINT_FRAMES = [
     r'must account for', r'should be visible', r'at least \d+[%$]?',
@@ -1265,7 +1257,6 @@ def run_instruction_density(text):
 Ref: Mitchell et al. (2023) "DetectGPT" -- semantic density as AI signal.
 """
 
-# (semantic_resonance: uses HAS_SEMANTIC, _EMBEDDER, _AI_CENTROIDS, _HUMAN_CENTROIDS, _cosine_similarity from compat)
 
 
 def run_semantic_resonance(text):
@@ -1798,7 +1789,6 @@ Ref: Yang et al. (2024) "DNA-GPT" (ICLR 2024)
 Ref: Li et al. (2004) "The Similarity Metric" (NCD theory)
 """
 
-# (continuation_local: uses _dna_ngrams, _dna_bscore, _dna_truncate_text from continuation_api section above)
 
 _TOKEN_RE = re.compile(r'\w+|[^\w\s]')
 
@@ -2055,7 +2045,6 @@ AI text has low perplexity (< 20); human text typically > 35.
 Ref: GLTR (Gehrmann et al. 2019), DetectGPT (Mitchell et al. 2023)
 """
 
-# (perplexity: uses HAS_PERPLEXITY, _PPL_MODEL, _PPL_TOKENIZER, _torch from compat)
 
 
 def run_perplexity(text):
@@ -2127,7 +2116,6 @@ def run_perplexity(text):
 Masks topical content before computing style features to reduce topic leakage.
 """
 
-# (stylometry: uses ENGLISH_FUNCTION_WORDS, get_sentences from text_utils)
 
 # Topic masking patterns
 _TOPIC_URL_RE = re.compile(r'https?://\S+|www\.\S+', re.I)
@@ -2239,7 +2227,6 @@ def extract_stylometric_features(text, masked_text=None):
 Ref: M4GT-Bench (Wang et al. 2024) -- mixed detection as separate task.
 """
 
-# (windowing: uses ENGLISH_FUNCTION_WORDS, get_sentences, _FORMULAIC_PATTERNS, _TRANSITION, _POWER_ADJ)
 
 
 def score_windows(text, window_size=5, stride=2):
@@ -3265,7 +3252,6 @@ Usage:
     result = run_prompt_signature_enhanced(text)
 """
 
-# (integration: all functions defined in sections above)
 _HAS_ANALYZERS = True
 
 
@@ -3518,7 +3504,6 @@ class ChannelResult:
 Combines preamble, prompt signature, voice dissonance, instruction density, SSI.
 """
 
-# (uses ChannelResult from channel base class section above)
 
 
 def score_prompt_structure(preamble_score, preamble_severity, prompt_sig, voice_dis, instr_density, word_count):
@@ -3636,7 +3621,6 @@ def score_prompt_structure(preamble_score, preamble_severity, prompt_sig, voice_
 Combines NSSI, semantic resonance, perplexity, and fingerprints.
 """
 
-# (uses ChannelResult from channel base class section above)
 
 
 def score_stylometric(fingerprint_score, self_sim, voice_dis=None, semantic=None, ppl=None):
@@ -3739,7 +3723,6 @@ def score_stylometric(fingerprint_score, self_sim, voice_dis=None, semantic=None
 # ==============================================================================
 """Channel 3: Continuation-based detection (DNA-GPT / DNA-GPT-Local)."""
 
-# (uses ChannelResult from channel base class section above)
 
 
 def score_continuation(cont_result):
@@ -3790,7 +3773,6 @@ def score_continuation(cont_result):
 # ==============================================================================
 """Channel 4: Sentence-window scoring for mixed content detection."""
 
-# (uses ChannelResult from channel base class section above)
 
 
 def score_windowed(window_result=None):
@@ -4590,7 +4572,6 @@ import threading
 from collections import Counter
 
 
-# (gui: uses HAS_TK, tk, ttk, filedialog, messagebox from compat section above)
 
 
 class DetectorGUI:
