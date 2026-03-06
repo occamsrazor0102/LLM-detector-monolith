@@ -105,7 +105,7 @@ def test_apply_without_cal_table():
     result = apply_calibration(0.75, None)
     check("raw unchanged", result['calibrated_confidence'] == 0.75,
           f"got {result['calibrated_confidence']}")
-    check("p_value is None", result['p_value'] is None)
+    check("confidence_quantile is None", result['confidence_quantile'] is None)
     check("stratum is uncalibrated", result['stratum_used'] == 'uncalibrated')
 
 
@@ -119,7 +119,7 @@ def test_apply_with_cal_table():
     result = apply_calibration(0.75, cal_table)
     check("calibrated_confidence is a number",
           isinstance(result['calibrated_confidence'], (int, float)))
-    check("p_value is a number", isinstance(result['p_value'], (int, float)))
+    check("confidence_quantile is a number", isinstance(result['confidence_quantile'], (int, float)))
 
 
 def test_stratum_fallback():
@@ -140,22 +140,22 @@ def test_stratum_fallback():
 
 
 def test_pvalue_monotonicity():
-    print("\n-- p-value monotonicity --")
+    print("\n-- confidence_quantile monotonicity --")
     cal_table = {
         'global': {0.01: 0.10, 0.05: 0.30, 0.10: 0.50},
         'strata': {},
         'n_calibration': 100,
     }
-    # As confidence increases, nc_score decreases, p_value should increase
+    # As confidence increases, nc_score decreases, quantile should increase
     confidences = [0.40, 0.60, 0.75, 0.85, 0.95]
-    p_values = []
+    quantiles = []
     for conf in confidences:
         result = apply_calibration(conf, cal_table)
-        p_values.append(result['p_value'])
+        quantiles.append(result['confidence_quantile'])
 
-    check("p-values are monotonically non-decreasing as confidence increases",
-          all(p_values[i] <= p_values[i+1] for i in range(len(p_values) - 1)),
-          f"p_values={p_values} for confidences={confidences}")
+    check("confidence_quantiles are monotonically non-decreasing as confidence increases",
+          all(quantiles[i] <= quantiles[i+1] for i in range(len(quantiles) - 1)),
+          f"quantiles={quantiles} for confidences={confidences}")
 
 
 if __name__ == '__main__':
