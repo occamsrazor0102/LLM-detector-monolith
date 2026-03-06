@@ -64,6 +64,38 @@ def test_perplexity():
         check("Unavailable: perplexity=0", r_short['perplexity'] == 0.0)
 
 
+def test_perplexity_diveye_fields():
+    print("\n-- PERPLEXITY DIVEYE FIELDS --")
+
+    short = "Hello world."
+    r_short = run_perplexity(short)
+    check("Short text: surprisal_variance present",
+          'surprisal_variance' in r_short)
+    check("Short text: volatility_decay present",
+          'volatility_decay' in r_short)
+    check("Short text: volatility_decay == 1.0",
+          r_short['volatility_decay'] == 1.0,
+          f"got {r_short['volatility_decay']}")
+    check("Short text: n_tokens present",
+          'n_tokens' in r_short)
+    check("Short text: n_tokens == 0",
+          r_short['n_tokens'] == 0,
+          f"got {r_short['n_tokens']}")
+
+    if HAS_PERPLEXITY:
+        r_ai = run_perplexity(AI_TEXT)
+        check("AI text: surprisal_variance > 0",
+              r_ai['surprisal_variance'] > 0,
+              f"got {r_ai['surprisal_variance']}")
+        check("AI text: volatility_decay > 0",
+              r_ai['volatility_decay'] > 0,
+              f"got {r_ai['volatility_decay']}")
+        check("AI text: n_tokens > 0",
+              r_ai.get('n_tokens', 0) > 0)
+    else:
+        print("  (transformers/torch not installed -- skipping DivEye model tests)")
+
+
 def test_feature_flags():
     print("\n-- FEATURE AVAILABILITY FLAGS --")
     check("HAS_SEMANTIC is bool", isinstance(HAS_SEMANTIC, bool))
@@ -79,6 +111,7 @@ if __name__ == '__main__':
     test_feature_flags()
     test_semantic_resonance()
     test_perplexity()
+    test_perplexity_diveye_fields()
 
     print(f"\n{'=' * 70}")
     print(f"RESULTS: {PASSED} passed, {FAILED} failed")
