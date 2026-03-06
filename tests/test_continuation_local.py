@@ -4,12 +4,12 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from llm_detector.analyzers.continuation_local import (
+from llm_detector_monolith import (
     run_continuation_local, _BackoffNGramLM, _calculate_ncd,
     _internal_ngram_overlap, _repeated_ngram_rate, _type_token_ratio,
     _proxy_tokenize,
 )
-from llm_detector.channels.continuation import score_continuation
+from llm_detector_monolith import score_continuation
 from tests.conftest import AI_TEXT, HUMAN_TEXT
 
 PASSED = 0

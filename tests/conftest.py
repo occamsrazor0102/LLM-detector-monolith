@@ -1,5 +1,9 @@
 """Shared fixtures and sample texts for pipeline tests."""
 
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 AI_TEXT = (
     "This comprehensive analysis provides a thorough examination of the "
     "key factors that contribute to the overall effectiveness of the proposed "

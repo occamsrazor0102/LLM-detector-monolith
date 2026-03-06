@@ -3,13 +3,13 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from llm_detector.lexicon.packs import (
+from llm_detector_monolith import (
     PACK_REGISTRY, score_pack, score_packs,
     get_packs_for_layer, get_packs_for_mode,
     get_total_constraint_score, get_total_schema_score,
     get_total_exec_spec_score, get_category_score,
 )
-from llm_detector.lexicon.integration import (
+from llm_detector_monolith import (
     run_prompt_signature_enhanced,
     run_voice_dissonance_enhanced,
     run_instruction_density_enhanced,

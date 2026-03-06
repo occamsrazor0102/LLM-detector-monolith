@@ -3,8 +3,8 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from llm_detector.analyzers.windowing import score_windows
-from llm_detector.channels.windowed import score_windowed
+from llm_detector_monolith import score_windows
+from llm_detector_monolith import score_windowed
 from tests.conftest import AI_TEXT, HUMAN_TEXT
 
 PASSED = 0

@@ -6,9 +6,9 @@ import tempfile
 import shutil
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from llm_detector.pipeline import analyze_prompt
-from llm_detector.compat import HAS_PYPDF, HAS_SEMANTIC, HAS_PERPLEXITY, HAS_FTFY
-from llm_detector.io import load_pdf
+from llm_detector_monolith import analyze_prompt
+from llm_detector_monolith import HAS_PYPDF, HAS_SEMANTIC, HAS_PERPLEXITY, HAS_FTFY
+from llm_detector_monolith import load_pdf
 from tests.conftest import CLINICAL_TEXT
 
 PASSED = 0

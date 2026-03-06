@@ -3,7 +3,7 @@
 import sys, os, json, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from llm_detector.calibration import (
+from llm_detector_monolith import (
     calibrate_from_baselines, save_calibration, load_calibration,
     apply_calibration,
 )
