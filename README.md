@@ -14,20 +14,23 @@ The pipeline analyzes text across multiple independent layers, each targeting a 
 
 ### Detection Layers
 
-All detection logic lives in `llm_detector_monolith.py`:
+All detection logic lives in `llm_detector_monolith.py` (v0.65):
 
 | Layer | Description |
 |-------|-------------|
 | **Preamble** | Catches LLM output artifacts: assistant acknowledgments, artifact delivery frames, first-person creation claims, meta-design language, chain-of-thought leakage (`<think>` tags, reasoning-model self-correction phrases) |
-| **Fingerprint** | 120-word tiered lexicon of LLM-preferred vocabulary (diagnostic only, not standalone trigger) |
+| **Fingerprint** | 32-word tiered lexicon of LLM-preferred vocabulary (diagnostic only, not standalone trigger) |
 | **Prompt Signature** | Structural patterns of LLM-generated prompts: Constraint Frame Density, Must-Frame Saturation Rate, meta-evaluation design language |
 | **Voice Dissonance** | Measures contradiction between casual voice markers and technical specification density |
 | **Instruction Density** | Counts formal-exhaustive specification patterns: imperatives, conditionals, binary specs |
 | **Semantic Resonance** | Cosine similarity of sentence embeddings against AI/human archetype centroids |
-| **Self-Similarity** | N-gram Self-Similarity Index (NSSI) for detecting formulaic LLM patterns |
+| **Token Cohesiveness (TOCSIN)** | Semantic distance under random word deletion — AI text maintains higher cohesion (Ma & Wang, EMNLP 2024) |
+| **Self-Similarity** | N-gram Self-Similarity Index (NSSI) — 13 signals including structural compression delta (s13) |
 | **Continuation (API)** | DNA-GPT divergent continuation analysis via Anthropic/OpenAI API |
-| **Continuation (Local)** | Zero-LLM DNA-GPT proxy using backoff n-gram language model |
-| **Perplexity** | distilgpt2-based perplexity scoring with DivEye-inspired surprisal variance and volatility decay analysis |
+| **Continuation (Local)** | Multi-truncation DNA-GPT proxy: backoff n-gram LM at gamma=0.3/0.5/0.7 with stability scoring |
+| **Perplexity** | distilgpt2-based perplexity with DivEye surprisal variance, volatility decay, and compression-perplexity divergence (Carlini et al. 2021) |
+| **Windowed** | Sentence-window scoring with FW trajectory, compression profile, and CUSUM changepoint detection |
+| **Surprisal Trajectory** | Windowed analysis of per-token loss stationarity across the text |
 
 ### Scoring Channels
 
@@ -36,9 +39,9 @@ Signals are organized into four independent scoring channels:
 | Channel | Primary Layers |
 |---------|----------------|
 | **Prompt Structure** | Preamble, Prompt Signature, Voice Dissonance, Instruction Density |
-| **Stylometric** | Self-Similarity, Semantic Resonance, Perplexity (incl. surprisal variance/volatility decay), Fingerprint |
-| **Continuation** | Continuation API or Continuation Local |
-| **Windowed** | Sentence-window scoring |
+| **Stylometric** | Self-Similarity (NSSI), Semantic Resonance, TOCSIN, Perplexity, Fingerprint |
+| **Continuation** | Multi-truncation Continuation (API or Local), NCD matrix, Surprisal improvement curve |
+| **Windowed** | Sentence-window scoring, FW trajectory CV, Compression trajectory, CUSUM changepoint |
 
 ### Determination Levels
 
@@ -53,7 +56,7 @@ Signals are organized into four independent scoring channels:
 
 ```
 llm_detector_monolith.py       # All detection logic in a single module
-tests/                         # Test suite
+tests/                         # Test suite (10 test files, 220+ tests)
 run_detector                   # Thin CLI launcher
 pyproject.toml                 # Package metadata & dependencies
 llm_detector.spec              # PyInstaller build spec
@@ -65,7 +68,7 @@ llm_detector.spec              # PyInstaller build spec
 pip install openpyxl pandas
 # Optional (improves sentence segmentation):
 pip install spacy
-# Optional (semantic resonance layer):
+# Optional (semantic resonance + TOCSIN):
 pip install sentence-transformers scikit-learn
 # Optional (perplexity scoring + surprisal variance):
 pip install transformers torch
@@ -138,17 +141,44 @@ result = analyze_prompt(
 print(result['determination'])       # RED / AMBER / YELLOW / GREEN
 print(result['reason'])              # Primary signal description
 print(result['confidence'])          # 0.0 - 1.0
-print(result['supporting_signals'])  # List of other signals that fired
+
+# Channel details and agreement
+print(result['channel_details'])     # Per-channel severity/score/explanation
+print(result['channel_details']['channel_agreement'])  # AGREE / DISAGREE
 
 # Layer-level diagnostics
 print(result['voice_dissonance_vsd'])            # Voice-Specification Dissonance
 print(result['prompt_signature_composite'])      # Prompt signature composite
 print(result['instruction_density_idi'])         # Instruction Density Index
 
-# Perplexity + surprisal variance (requires transformers + torch)
+# Perplexity + compression-perplexity divergence (requires transformers + torch)
 print(result['perplexity_value'])                # Mean perplexity
 print(result['perplexity_surprisal_variance'])   # Token-level surprisal variance
 print(result['perplexity_volatility_decay'])     # First/second half variance ratio
+print(result['perplexity_zlib_normalized_ppl'])  # zlib-normalized perplexity
+print(result['perplexity_comp_ppl_ratio'])       # Compression-perplexity ratio
+
+# Continuation (multi-truncation)
+print(result['continuation_composite'])          # DNA-GPT local composite
+print(result['continuation_composite_stability'])# Stability across gamma=0.3/0.5/0.7
+print(result['continuation_ncd_matrix_mean'])    # Multi-segment NCD mean
+print(result['continuation_improvement_rate'])   # Surprisal improvement rate
+
+# Windowed analysis
+print(result['window_fw_trajectory_cv'])         # Function word trajectory CV
+print(result['window_comp_trajectory_cv'])       # Compression trajectory CV
+print(result['window_changepoint'])              # CUSUM changepoint (or None)
+
+# Surprisal trajectory
+print(result['surprisal_stationarity'])          # Loss stationarity score
+print(result['surprisal_trajectory_cv'])         # Trajectory coefficient of variation
+
+# Token cohesiveness (TOCSIN)
+print(result['tocsin_cohesiveness'])             # Semantic cohesion under deletion
+
+# Conformal calibration
+print(result['calibrated_confidence'])           # Calibrated confidence
+print(result['confidence_quantile'])             # Conformal quantile
 
 # Cross-submission similarity (batch mode)
 from llm_detector_monolith import analyze_similarity
@@ -163,11 +193,14 @@ flags = analyze_similarity(results, text_map)
 python tests/test_pipeline.py
 python tests/test_analyzers.py
 python tests/test_continuation_local.py
+python tests/test_continuation_multi.py
+python tests/test_compressibility.py
 python tests/test_fusion.py
 python tests/test_normalize.py
 python tests/test_calibration.py
 python tests/test_lexicon.py
 python tests/test_windowed.py
+python tests/test_preamble_cot.py
 ```
 
 ## Design Principles
@@ -178,7 +211,7 @@ python tests/test_windowed.py
 
 **Voice gate preserves specificity.** Voice Dissonance requires actual casual voice absence, not just specification presence. A human writing formal text naturally varies more than an LLM generating sterile specifications.
 
-**Diagnostic layers inform but don't trigger.** Fingerprint analysis participates in convergence and similarity analysis but doesn't fire standalone signals — the false positive rate on individual vocabulary items is too high.
+**Diagnostic layers inform but don't trigger.** Fingerprint analysis participates in convergence and similarity analysis but doesn't fire standalone signals — the false positive rate on individual vocabulary items is too high. New v0.65 features (TOCSIN, surprisal trajectory, NCD matrix, compression trajectory, changepoint) emit diagnostics only until calibrated.
 
 **Supporting signals support.** Perplexity, surprisal variance, and volatility decay act as supporting signals only — they boost confidence when other channels already fire, but never promote severity on their own.
 
