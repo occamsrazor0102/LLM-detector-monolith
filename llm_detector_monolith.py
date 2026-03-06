@@ -1062,6 +1062,104 @@ def run_fingerprint(text):
     score = min(rate / 5.0, 1.0)
     return score, hits, rate
 
+
+def collect_spans(text):
+    """Collect character-level spans from all regex-based detectors.
+
+    Returns a sorted list of dicts, each with:
+        start, end     – character offsets into *text*
+        text           – the matched substring
+        layer          – which detector family fired
+        pattern        – pattern identifier
+        severity       – CRITICAL / HIGH / MEDIUM / LOW
+        weight         – numeric weight (matches scoring weights where applicable)
+
+    Spans are purely diagnostic; they do not affect scoring.
+    """
+    spans = []
+
+    # --- Preamble patterns ---
+    first_500_names = {
+        'assistant_ack', 'artifact_delivery', 'first_person_creation', 'cot_leakage',
+    }
+    for pat_str, name, sev in PREAMBLE_PATTERNS:
+        search_text = text[:500] if name in first_500_names else text
+        for m in re.finditer(pat_str, search_text):
+            spans.append({
+                'start': m.start(),
+                'end': m.end(),
+                'text': m.group(),
+                'layer': 'preamble',
+                'pattern': name,
+                'severity': sev,
+                'weight': {'CRITICAL': 0.99, 'HIGH': 0.75, 'MEDIUM': 0.50}.get(sev, 0.0),
+            })
+
+    # --- Fingerprint words ---
+    for m in _FINGERPRINT_RE.finditer(text):
+        spans.append({
+            'start': m.start(),
+            'end': m.end(),
+            'text': m.group(),
+            'layer': 'fingerprint',
+            'pattern': 'fingerprint_word',
+            'severity': 'LOW',
+            'weight': 1.0,
+        })
+
+    # --- Formulaic academic phrases ---
+    for compiled_pat, weight in _FORMULAIC_PATTERNS:
+        for m in compiled_pat.finditer(text):
+            spans.append({
+                'start': m.start(),
+                'end': m.end(),
+                'text': m.group(),
+                'layer': 'formulaic',
+                'pattern': compiled_pat.pattern[:60],
+                'severity': 'MEDIUM',
+                'weight': weight,
+            })
+
+    # --- Power adjectives ---
+    for m in _POWER_ADJ.finditer(text):
+        spans.append({
+            'start': m.start(),
+            'end': m.end(),
+            'text': m.group(),
+            'layer': 'power_adj',
+            'pattern': 'power_adjective',
+            'severity': 'LOW',
+            'weight': 1.0,
+        })
+
+    # --- Transition connectors ---
+    for m in _TRANSITION.finditer(text):
+        spans.append({
+            'start': m.start(),
+            'end': m.end(),
+            'text': m.group(),
+            'layer': 'transition',
+            'pattern': 'transition_connector',
+            'severity': 'LOW',
+            'weight': 1.0,
+        })
+
+    # --- Demonstrative phrases ---
+    for m in _DEMONSTRATIVE.finditer(text):
+        spans.append({
+            'start': m.start(),
+            'end': m.end(),
+            'text': m.group(),
+            'layer': 'demonstrative',
+            'pattern': 'demonstrative_phrase',
+            'severity': 'LOW',
+            'weight': 1.0,
+        })
+
+    spans.sort(key=lambda s: s['start'])
+    return spans
+
+
 # ==============================================================================
 # ANALYZER: PROMPT SIGNATURE
 # ==============================================================================
@@ -4569,6 +4667,9 @@ def analyze_prompt(text, task_id='', occupation='', attempter='', stage='',
     # Windowed scoring
     window_result = score_windows(text_for_analysis)
 
+    # Span-level explainability (diagnostic)
+    _spans = collect_spans(text_for_analysis)
+
     # Evidence fusion
     det, reason, confidence, channel_details = determine(
         preamble_score, preamble_severity, prompt_sig, voice_dis, instr_density, word_count,
@@ -4823,6 +4924,9 @@ def analyze_prompt(text, task_id='', occupation='', attempter='', stage='',
             'continuation_improvement_rate': 0.0,
             'continuation_ncd_matrix_mean': 0.0, 'continuation_ncd_matrix_variance': 0.0,
         })
+
+    # Span-level explainability
+    result['_spans'] = _spans
 
     return result
 
