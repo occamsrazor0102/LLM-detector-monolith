@@ -3,8 +3,7 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from llm_detector_monolith import score_windows
-from llm_detector_monolith import score_windowed
+from llm_detector_monolith import score_windows, score_windowed, detect_changepoint
 from tests.conftest import AI_TEXT, HUMAN_TEXT
 
 PASSED = 0
@@ -119,6 +118,59 @@ def test_channel_high_hot_span():
           f"got {ch.severity}")
 
 
+def test_fw_trajectory_cv():
+    print("\n-- FW trajectory CV field (FEAT 3) --")
+    result = score_windows(LONG_AI_TEXT)
+    check("fw_trajectory_cv present", 'fw_trajectory_cv' in result,
+          f"keys: {list(result.keys())}")
+    check("fw_trajectory_cv >= 0", result.get('fw_trajectory_cv', -1) >= 0)
+
+    # Short text early return should also have it
+    short_result = score_windows(SHORT_TEXT)
+    check("short text fw_trajectory_cv present", 'fw_trajectory_cv' in short_result)
+    check("short text fw_trajectory_cv == 0", short_result['fw_trajectory_cv'] == 0.0)
+
+
+def test_comp_trajectory():
+    print("\n-- Compression trajectory fields (FEAT 4) --")
+    result = score_windows(LONG_AI_TEXT)
+    check("comp_trajectory_cv present", 'comp_trajectory_cv' in result)
+    check("comp_trajectory_mean present", 'comp_trajectory_mean' in result)
+    if result['n_windows'] > 0:
+        check("comp_trajectory_mean > 0", result['comp_trajectory_mean'] > 0,
+              f"got {result['comp_trajectory_mean']}")
+
+
+def test_changepoint_none_for_uniform():
+    print("\n-- Changepoint: None for uniform scores --")
+    # Uniform sequence should not detect a changepoint
+    result = detect_changepoint([0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2])
+    check("uniform scores -> None", result is None, f"got {result}")
+
+
+def test_changepoint_detects_step():
+    print("\n-- Changepoint: detects obvious step function --")
+    # Use threshold=1.0 to test the algorithm itself
+    step = [0.1, 0.1, 0.1, 0.1, 0.8, 0.8, 0.8, 0.8]
+    result = detect_changepoint(step, threshold=1.0)
+    check("step function detected", result is not None, "got None")
+    if result:
+        check("changepoint near middle",
+              2 <= result['changepoint_sentence'] <= 5,
+              f"got {result['changepoint_sentence']}")
+        check("effect_size > 1.0", result['effect_size'] > 1.0,
+              f"got {result['effect_size']}")
+
+
+def test_changepoint_in_score_windows():
+    print("\n-- Changepoint field in score_windows --")
+    result = score_windows(LONG_AI_TEXT)
+    check("changepoint key present", 'changepoint' in result)
+
+    short_result = score_windows(SHORT_TEXT)
+    check("short text changepoint is None", short_result['changepoint'] is None)
+
+
 if __name__ == '__main__':
     print("=" * 70)
     print("  WINDOWED SCORING TESTS")
@@ -131,6 +183,11 @@ if __name__ == '__main__':
     test_channel_none_returns_green()
     test_channel_empty_windows()
     test_channel_high_hot_span()
+    test_fw_trajectory_cv()
+    test_comp_trajectory()
+    test_changepoint_none_for_uniform()
+    test_changepoint_detects_step()
+    test_changepoint_in_score_windows()
 
     print(f"\n{'=' * 70}")
     print(f"  RESULTS: {PASSED} passed, {FAILED} failed")
