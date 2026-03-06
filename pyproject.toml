@@ -42,10 +42,10 @@ bundle = [
 ]
 
 [project.scripts]
-llm-detector = "llm_detector.cli:main"
+llm-detector = "llm_detector_monolith:main"
 
 [project.gui-scripts]
-llm-detector-gui = "llm_detector.cli:main_gui"
+llm-detector-gui = "llm_detector_monolith:main_gui"
 
-[tool.setuptools.packages.find]
-include = ["llm_detector*"]
+[tool.setuptools]
+py-modules = ["llm_detector_monolith"]

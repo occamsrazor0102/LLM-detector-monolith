@@ -10,24 +10,22 @@ Or for a single-file executable:
 """
 
 import sys
-from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
 
-# Collect all submodules of the package
-hiddenimports = collect_submodules('llm_detector')
-
 # Optional deps — include if installed, skip gracefully if not
+hiddenimports = []
 for mod in ['anthropic', 'openai', 'pypdf', 'spacy', 'ftfy',
             'sentence_transformers', 'sklearn', 'transformers', 'torch']:
     try:
         __import__(mod)
+        from PyInstaller.utils.hooks import collect_submodules
         hiddenimports += collect_submodules(mod)
     except ImportError:
         pass
 
 a = Analysis(
-    ['llm_detector/__main__.py'],
+    ['llm_detector_monolith.py'],
     pathex=[],
     binaries=[],
     datas=[],
