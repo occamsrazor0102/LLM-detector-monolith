@@ -3,7 +3,8 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from llm_detector_monolith import collect_spans, analyze_prompt
+from llm_detector_monolith import (collect_spans, analyze_prompt, score_pack,
+                                    generate_html_report, run_preamble)
 from tests.conftest import AI_TEXT, HUMAN_TEXT
 
 PASSED = 0
@@ -182,6 +183,98 @@ def test_overlapping_layers():
           f"layers: {comp_layers}")
 
 
+def test_pack_score_spans():
+    print("\n-- PackScore has spans after scoring --")
+    text = "You MUST include all required fields. The system SHALL NOT exceed limits."
+    ps = score_pack(text, 'obligation', n_sentences=2)
+    check("PackScore has spans attr", hasattr(ps, 'spans'))
+    check("spans is list", isinstance(ps.spans, list))
+    if ps.raw_hits > 0:
+        check("spans non-empty when hits > 0", len(ps.spans) > 0,
+              f"hits={ps.raw_hits}, spans={len(ps.spans)}")
+        s = ps.spans[0]
+        check("span has start", 'start' in s)
+        check("span has end", 'end' in s)
+        check("span has pack name", s.get('pack') == 'obligation',
+              f"got {s.get('pack')}")
+        check("span text matches slice",
+              text[s['start']:s['end']].lower() == s['text'].lower()[:len(text[s['start']:s['end']])],
+              f"span={s['text']!r}, slice={text[s['start']:s['end']]!r}")
+
+
+def test_preamble_returns_4_tuple():
+    print("\n-- run_preamble returns 4-tuple with spans --")
+    text = "Sure thing! Here is your revised evaluation prompt."
+    result = run_preamble(text)
+    check("returns 4-tuple", len(result) == 4, f"got {len(result)}-tuple")
+    score, sev, hits, spans = result
+    check("score is float", isinstance(score, float))
+    check("spans is list", isinstance(spans, list))
+    if spans:
+        s = spans[0]
+        check("span has start/end", 'start' in s and 'end' in s)
+        check("span has pattern", 'pattern' in s)
+        check("span has severity", 'severity' in s)
+
+
+def test_detection_spans_in_pipeline():
+    print("\n-- Pipeline: detection_spans merges all sources --")
+    result = analyze_prompt(text=AI_TEXT, task_id="det_span_test")
+    check("detection_spans key present", 'detection_spans' in result)
+    ds = result.get('detection_spans', [])
+    check("detection_spans is list", isinstance(ds, list))
+    # Should include at least base spans (fingerprint/formulaic/etc)
+    if ds:
+        layers = {s.get('layer', s.get('type', s.get('pack', '?'))) for s in ds}
+        check("multiple span sources", len(layers) >= 1,
+              f"layers: {layers}")
+
+
+def test_html_report_basic():
+    print("\n-- HTML report generation --")
+    text = "This comprehensive analysis leverages robust frameworks."
+    result = {
+        'determination': 'AMBER',
+        'reason': 'Test reason',
+        'confidence': 0.75,
+        'task_id': 'html_test',
+        'word_count': 7,
+        'mode': 'auto',
+        'detection_spans': [
+            {'start': 5, 'end': 18, 'text': 'comprehensive', 'severity': 'LOW',
+             'pattern': 'fingerprint_word'},
+        ],
+        'channel_details': {
+            'channels': {
+                'prompt_structure': {'severity': 'AMBER', 'explanation': 'test'},
+                'stylometry': {'severity': 'GREEN', 'explanation': ''},
+                'continuation': {'severity': 'GREEN', 'explanation': ''},
+                'windowing': {'severity': 'GREEN', 'explanation': ''},
+            }
+        },
+    }
+    html = generate_html_report(text, result)
+    check("returns string", isinstance(html, str))
+    check("contains DOCTYPE", '<!DOCTYPE html>' in html)
+    check("contains determination", 'AMBER' in html)
+    check("contains highlighted span", 'signal-LOW' in html)
+    check("contains task_id", 'html_test' in html)
+
+
+def test_html_empty_spans():
+    print("\n-- HTML report with no spans --")
+    text = "Plain text with no signals."
+    result = {
+        'determination': 'GREEN', 'reason': '', 'confidence': 0.0,
+        'task_id': 'empty', 'word_count': 6, 'mode': 'auto',
+        'detection_spans': [],
+        'channel_details': {'channels': {}},
+    }
+    html = generate_html_report(text, result)
+    check("produces valid HTML", '<!DOCTYPE html>' in html)
+    check("contains escaped text", 'Plain text' in html)
+
+
 if __name__ == '__main__':
     print("=" * 70)
     print("  SPAN-LEVEL EXPLAINABILITY TESTS")
@@ -200,6 +293,11 @@ if __name__ == '__main__':
     test_human_text_fewer_spans()
     test_pipeline_integration()
     test_overlapping_layers()
+    test_pack_score_spans()
+    test_preamble_returns_4_tuple()
+    test_detection_spans_in_pipeline()
+    test_html_report_basic()
+    test_html_empty_spans()
 
     print(f"\n{'=' * 70}")
     print(f"  RESULTS: {PASSED} passed, {FAILED} failed")

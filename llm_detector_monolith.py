@@ -1011,17 +1011,26 @@ PREAMBLE_PATTERNS = [
 
 
 def run_preamble(text):
-    """Detect LLM preamble artifacts. Returns (score, severity, hits)."""
+    """Detect LLM preamble artifacts. Returns (score, severity, hits, spans)."""
     first_500 = text[:500]
     hits = []
+    spans = []
     severity = 'NONE'
 
     for pat, name, sev in PREAMBLE_PATTERNS:
         search_text = first_500 if name in (
             'assistant_ack', 'artifact_delivery', 'first_person_creation', 'cot_leakage',
         ) else text
-        if re.search(pat, search_text):
+        match = re.search(pat, search_text)
+        if match:
             hits.append((name, sev))
+            spans.append({
+                'start': match.start(),
+                'end': match.end(),
+                'text': match.group()[:80],
+                'pattern': name,
+                'severity': sev,
+            })
             if sev == 'CRITICAL':
                 severity = 'CRITICAL'
             elif sev == 'HIGH' and severity not in ('CRITICAL',):
@@ -1030,7 +1039,7 @@ def run_preamble(text):
                 severity = 'MEDIUM'
 
     score = {'CRITICAL': 0.99, 'HIGH': 0.75, 'MEDIUM': 0.50, 'NONE': 0.0}[severity]
-    return score, severity, hits
+    return score, severity, hits, spans
 
 # ==============================================================================
 # ANALYZER: FINGERPRINT
@@ -3580,6 +3589,7 @@ class PackScore:
     raw_score: float = 0.0
     capped_score: float = 0.0
     matches: List[str] = field(default_factory=list)
+    spans: List[dict] = field(default_factory=list)
 
 
 def score_pack(text: str, pack_name: str, n_sentences: int = 1) -> PackScore:
@@ -3599,25 +3609,49 @@ def score_pack(text: str, pack_name: str, n_sentences: int = 1) -> PackScore:
 
     result = PackScore(pack_name=pack_name, category=pack.category)
 
-    # Pattern matching
+    # Pattern matching (finditer for span capture)
     for compiled_re, weight in compiled:
-        found = compiled_re.findall(text)
-        if found:
-            result.raw_hits += len(found)
-            result.weighted_hits += len(found) * weight
-            result.matches.extend(found[:3])  # Keep first 3 for diagnostics
+        for m in compiled_re.finditer(text):
+            result.raw_hits += 1
+            result.weighted_hits += weight
+            if len(result.matches) < 3:
+                result.matches.append(m.group())
+            result.spans.append({
+                'start': m.start(),
+                'end': m.end(),
+                'text': m.group()[:80],
+                'pack': pack_name,
+                'weight': weight,
+            })
 
-    # Keyword matching (fast path, no weight — counted separately)
+    # Keyword matching (finditer for span capture)
     kw_re = _KEYWORD_RES.get(pack_name)
     if kw_re:
-        result.keyword_hits = len(kw_re.findall(text))
+        for m in kw_re.finditer(text):
+            result.keyword_hits += 1
+            result.spans.append({
+                'start': m.start(),
+                'end': m.end(),
+                'text': m.group(),
+                'pack': pack_name,
+                'weight': 0.0,
+                'type': 'keyword',
+            })
 
-    # Uppercase keyword matching (case-sensitive)
+    # Uppercase keyword matching (case-sensitive, finditer for span capture)
     uc_re = _UPPERCASE_RES.get(pack_name)
     if uc_re:
-        result.uppercase_hits = len(uc_re.findall(text))
-        # Uppercase normative forms get bonus weight
-        result.weighted_hits += result.uppercase_hits * 2.0
+        for m in uc_re.finditer(text):
+            result.uppercase_hits += 1
+            result.weighted_hits += 2.0
+            result.spans.append({
+                'start': m.start(),
+                'end': m.end(),
+                'text': m.group(),
+                'pack': pack_name,
+                'weight': 2.0,
+                'type': 'uppercase',
+            })
 
     # Density-normalized score: weighted_hits per sentence × family_weight
     density = result.weighted_hits / n_sents
@@ -3927,6 +3961,10 @@ def run_prompt_signature_enhanced(text: str, base_result: Optional[dict] = None)
             for name, s in all_pack_scores.items()
             if s.raw_hits > 0
         },
+        'pack_spans': sorted(
+            [sp for s in all_pack_scores.values() for sp in s.spans],
+            key=lambda x: x['start'],
+        ),
     })
 
     return result
@@ -3990,6 +4028,10 @@ def run_voice_dissonance_enhanced(text: str, base_result: Optional[dict] = None)
             for name, s in all_pack_scores.items()
             if s.raw_hits > 0
         },
+        'pack_spans': sorted(
+            [sp for s in all_pack_scores.values() for sp in s.spans],
+            key=lambda x: x['start'],
+        ),
     })
 
     return result
@@ -4044,6 +4086,10 @@ def run_instruction_density_enhanced(text: str, base_result: Optional[dict] = No
             for name, s in idi_scores.items()
             if s.raw_hits > 0
         },
+        'pack_spans': sorted(
+            [sp for s in idi_scores.values() for sp in s.spans],
+            key=lambda x: x['start'],
+        ),
     })
 
     return result
@@ -4632,7 +4678,7 @@ def analyze_prompt(text, task_id='', occupation='', attempter='', stage='',
     text_for_analysis = normalized_text
 
     # Run all analyzers
-    preamble_score, preamble_severity, preamble_hits = run_preamble(text_for_analysis)
+    preamble_score, preamble_severity, preamble_hits, preamble_spans = run_preamble(text_for_analysis)
     fingerprint_score, fingerprint_hits, fingerprint_rate = run_fingerprint(text_for_analysis)
     prompt_sig = run_prompt_signature_enhanced(text_for_analysis)
     voice_dis = run_voice_dissonance_enhanced(text_for_analysis)
@@ -4668,7 +4714,7 @@ def analyze_prompt(text, task_id='', occupation='', attempter='', stage='',
     window_result = score_windows(text_for_analysis)
 
     # Span-level explainability (diagnostic)
-    _spans = collect_spans(text_for_analysis)
+    _base_spans = collect_spans(text_for_analysis)
 
     # Evidence fusion
     det, reason, confidence, channel_details = determine(
@@ -4925,10 +4971,347 @@ def analyze_prompt(text, task_id='', occupation='', attempter='', stage='',
             'continuation_ncd_matrix_mean': 0.0, 'continuation_ncd_matrix_variance': 0.0,
         })
 
-    # Span-level explainability
-    result['_spans'] = _spans
+    # Span-level explainability — merge all span sources
+    all_spans = list(_base_spans)
+    all_spans.extend(preamble_spans)
+    all_spans.extend(prompt_sig.get('pack_spans', []))
+    all_spans.extend(voice_dis.get('pack_spans', []))
+    all_spans.extend(instr_density.get('pack_spans', []))
+    # Hot window sentence ranges
+    for w in window_result.get('windows', []):
+        if w['score'] >= 0.30:
+            all_spans.append({
+                'start_sentence': w['start'],
+                'end_sentence': w['end'],
+                'score': w['score'],
+                'type': 'hot_window',
+            })
+    all_spans.sort(key=lambda s: s.get('start', s.get('start_sentence', 0)))
+    result['_spans'] = all_spans
+    result['detection_spans'] = all_spans
 
     return result
+
+
+# ==============================================================================
+# REPORTING: ATTEMPTER PROFILING
+# ==============================================================================
+
+
+def profile_attempters(results, min_submissions=2):
+    """Aggregate detection results by attempter.
+
+    Returns list of attempter profiles sorted by flag rate (descending).
+    """
+    by_attempter = {}
+    for r in results:
+        att = r.get('attempter', '').strip()
+        if att:
+            by_attempter.setdefault(att, []).append(r)
+
+    profiles = []
+    for att, submissions in by_attempter.items():
+        if len(submissions) < min_submissions:
+            continue
+
+        det_counts = {}
+        for r in submissions:
+            d = r.get('determination', 'GREEN')
+            det_counts[d] = det_counts.get(d, 0) + 1
+
+        n_total = len(submissions)
+        n_flagged = det_counts.get('RED', 0) + det_counts.get('AMBER', 0) + det_counts.get('MIXED', 0)
+        flag_rate = n_flagged / n_total
+
+        # Primary detection channel for flagged submissions
+        flagged_channels = {}
+        for r in submissions:
+            if r.get('determination') in ('RED', 'AMBER', 'MIXED'):
+                cd = r.get('channel_details', {}).get('channels', {})
+                for ch_name, ch_info in cd.items():
+                    if ch_info.get('severity') in ('RED', 'AMBER'):
+                        flagged_channels[ch_name] = flagged_channels.get(ch_name, 0) + 1
+
+        primary_channel = max(flagged_channels, key=flagged_channels.get) if flagged_channels else None
+
+        flagged_confs = [r['confidence'] for r in submissions
+                         if r.get('determination') in ('RED', 'AMBER', 'MIXED')]
+        mean_conf = sum(flagged_confs) / len(flagged_confs) if flagged_confs else 0.0
+
+        profiles.append({
+            'attempter': att,
+            'total_submissions': n_total,
+            'flagged': n_flagged,
+            'flag_rate': round(flag_rate, 3),
+            'red': det_counts.get('RED', 0),
+            'amber': det_counts.get('AMBER', 0),
+            'yellow': det_counts.get('YELLOW', 0),
+            'green': det_counts.get('GREEN', 0),
+            'mixed': det_counts.get('MIXED', 0),
+            'mean_flagged_confidence': round(mean_conf, 3),
+            'primary_detection_channel': primary_channel,
+            'occupations': list(set(r.get('occupation', '') for r in submissions if r.get('occupation'))),
+        })
+
+    profiles.sort(key=lambda p: (-p['flag_rate'], -p['flagged']))
+    return profiles
+
+
+def print_attempter_report(profiles):
+    """Print attempter profiling summary to stdout."""
+    if not profiles:
+        print("\n  No attempter data available for profiling.")
+        return
+
+    flagged_profiles = [p for p in profiles if p['flagged'] > 0]
+    total_submissions = sum(p['total_submissions'] for p in profiles)
+    total_flagged = sum(p['flagged'] for p in profiles)
+
+    print(f"\n{'='*90}")
+    print(f"  ATTEMPTER PROFILING: {len(profiles)} contributors, "
+          f"{total_submissions} submissions")
+    print(f"{'='*90}")
+
+    if flagged_profiles and total_flagged > 0:
+        top_n = max(1, int(len(profiles) * 0.10))
+        top_flagged = sum(p['flagged'] for p in flagged_profiles[:top_n])
+        concentration = top_flagged / total_flagged * 100
+        print(f"\n  Concentration: Top {top_n} contributor(s) account for "
+              f"{concentration:.0f}% of all flagged submissions")
+
+        print(f"\n  {'Attempter':<25} {'Subs':>5} {'Flag':>5} {'Rate':>7} "
+              f"{'R':>3} {'A':>3} {'Y':>3} {'G':>3} {'Primary Channel':<20}")
+        print(f"  {'-'*85}")
+
+        for p in flagged_profiles:
+            ch = p['primary_detection_channel'] or '-'
+            print(f"  {p['attempter'][:24]:<25} {p['total_submissions']:>5} "
+                  f"{p['flagged']:>5} {p['flag_rate']:>6.0%} "
+                  f"{p['red']:>3} {p['amber']:>3} {p['yellow']:>3} {p['green']:>3} "
+                  f"{ch:<20}")
+
+    clean = [p for p in profiles if p['flagged'] == 0]
+    if clean:
+        print(f"\n  Clean contributors ({len(clean)}): "
+              f"{', '.join(p['attempter'][:20] for p in clean[:10])}"
+              f"{'...' if len(clean) > 10 else ''}")
+
+
+# ==============================================================================
+# REPORTING: FINANCIAL IMPACT
+# ==============================================================================
+
+
+def financial_impact(results, cost_per_prompt=400.0):
+    """Calculate financial impact of detection.
+
+    Returns dict with impact metrics.
+    """
+    n_total = len(results)
+    det_counts = {}
+    for r in results:
+        d = r.get('determination', 'GREEN')
+        det_counts[d] = det_counts.get(d, 0) + 1
+
+    n_flagged = det_counts.get('RED', 0) + det_counts.get('AMBER', 0) + det_counts.get('MIXED', 0)
+    flag_rate = n_flagged / max(n_total, 1)
+    total_spend = n_total * cost_per_prompt
+    waste_at_flag = n_flagged * cost_per_prompt
+    clean_count = n_total - n_flagged
+    clean_yield = clean_count / max(n_total, 1)
+    annual_waste = waste_at_flag * 4
+    annual_savings = annual_waste * 0.60
+
+    return {
+        'total_submissions': n_total,
+        'total_spend': total_spend,
+        'flagged_count': n_flagged,
+        'flag_rate': round(flag_rate, 3),
+        'waste_estimate': waste_at_flag,
+        'clean_yield': round(clean_yield, 3),
+        'clean_count': clean_count,
+        'projected_annual_waste': annual_waste,
+        'projected_annual_savings_60pct': annual_savings,
+    }
+
+
+def print_financial_report(impact, cost_per_prompt=400.0):
+    """Print financial impact summary to stdout."""
+    print(f"\n{'='*90}")
+    print(f"  FINANCIAL IMPACT ESTIMATE (${cost_per_prompt:.0f}/prompt)")
+    print(f"{'='*90}")
+    print(f"    Total submissions:       {impact['total_submissions']:>8}")
+    print(f"    Total spend:             ${impact['total_spend']:>10,.0f}")
+    print(f"    Flagged (RED+AMBER):     {impact['flagged_count']:>8}  "
+          f"({impact['flag_rate']:.1%})")
+    print(f"    Estimated waste:         ${impact['waste_estimate']:>10,.0f}")
+    print(f"    Clean yield:             {impact['clean_count']:>8}  "
+          f"({impact['clean_yield']:.1%})")
+    print(f"")
+    print(f"    Projected annual waste:  ${impact['projected_annual_waste']:>10,.0f}  "
+          f"(4 quarterly batches)")
+    print(f"    Annual savings (60%):    ${impact['projected_annual_savings_60pct']:>10,.0f}  "
+          f"(conservative catch rate)")
+
+
+# ==============================================================================
+# REPORTING: HTML REPORT GENERATOR
+# ==============================================================================
+
+_HTML_CSS = """
+body { font-family: 'Segoe UI', system-ui, sans-serif; max-width: 900px;
+       margin: 40px auto; padding: 0 20px; background: #fafafa; color: #1a1a1a; }
+.header { border-bottom: 3px solid #1a1a1a; padding-bottom: 16px; margin-bottom: 24px; }
+.det { font-size: 28px; font-weight: 700; }
+.det-RED { color: #d32f2f; } .det-AMBER { color: #f57c00; }
+.det-YELLOW { color: #fbc02d; } .det-GREEN { color: #388e3c; }
+.det-MIXED { color: #1976d2; }
+.meta { color: #666; font-size: 14px; margin-top: 8px; }
+.text-container { background: white; border: 1px solid #e0e0e0; border-radius: 8px;
+                  padding: 24px; line-height: 1.8; font-size: 15px; white-space: pre-wrap;
+                  word-wrap: break-word; }
+.signal { padding: 2px 0; border-bottom: 3px solid; cursor: help; }
+.signal-CRITICAL { border-color: #ff1744; background: #ffebee; }
+.signal-HIGH { border-color: #ff5722; background: #fbe9e7; }
+.signal-MEDIUM { border-color: #ff9800; background: #fff3e0; }
+.signal-LOW { border-color: #42a5f5; background: #e3f2fd; }
+.signal-hot_window { border-color: #ef5350; background: #ffcdd2; }
+.legend { margin-top: 24px; padding: 16px; background: #f5f5f5; border-radius: 8px;
+          font-size: 13px; }
+.legend span { display: inline-block; margin-right: 16px; }
+.channels { margin-top: 24px; }
+.ch-row { display: flex; align-items: center; padding: 8px 0;
+          border-bottom: 1px solid #eee; font-size: 14px; }
+.ch-name { width: 160px; font-weight: 600; }
+.ch-sev { width: 80px; font-weight: 600; }
+"""
+
+
+def _apply_highlights(text, spans):
+    """Apply highlight markup to text at span positions.
+
+    Handles overlapping spans by using the highest-severity span at each position.
+    """
+    import html as _html
+    if not spans:
+        return _html.escape(text)
+
+    severity_rank = {'CRITICAL': 4, 'HIGH': 3, 'MEDIUM': 2, 'LOW': 1}
+    char_map = [None] * len(text)
+    for span in spans:
+        start = span.get('start', -1)
+        end = span.get('end', start)
+        if start < 0:
+            continue
+        sev = span.get('severity', span.get('type', 'LOW'))
+        tooltip = span.get('pack', span.get('pattern', ''))
+        rank = severity_rank.get(sev, 0)
+        for i in range(max(0, start), min(end, len(text))):
+            if char_map[i] is None or rank > char_map[i][2]:
+                char_map[i] = (sev, tooltip, rank)
+
+    out = []
+    i = 0
+    while i < len(text):
+        if char_map[i] is None:
+            j = i
+            while j < len(text) and char_map[j] is None:
+                j += 1
+            out.append(_html.escape(text[i:j]))
+            i = j
+        else:
+            sev, tooltip, rank = char_map[i]
+            j = i
+            while j < len(text) and char_map[j] is not None and char_map[j][:2] == (sev, tooltip):
+                j += 1
+            css_class = f"signal-{sev}"
+            out.append(
+                f'<span class="signal {css_class}" title="{_html.escape(tooltip)}">'
+                f'{_html.escape(text[i:j])}</span>'
+            )
+            i = j
+
+    return ''.join(out)
+
+
+def generate_html_report(text, result, output_path=None):
+    """Generate an HTML report with highlighted detection spans.
+
+    Args:
+        text: Original input text.
+        result: Pipeline result dict (must include 'detection_spans' or '_spans').
+        output_path: Where to write the HTML file. If None, returns HTML string.
+    """
+    import html as _html
+
+    spans = result.get('detection_spans', result.get('_spans', []))
+    det = result.get('determination', 'GREEN')
+    reason = result.get('reason', '')
+    confidence = result.get('confidence', 0)
+    task_id = result.get('task_id', '')
+    word_count = result.get('word_count', 0)
+
+    char_spans = sorted(
+        [s for s in spans if 'start' in s and 'end' in s],
+        key=lambda s: s['start'],
+    )
+
+    highlighted = _apply_highlights(text, char_spans)
+
+    cd = result.get('channel_details', {}).get('channels', {})
+    channel_rows = []
+    for ch_name in ['prompt_structure', 'stylometry', 'continuation', 'windowing']:
+        info = cd.get(ch_name, {})
+        sev = info.get('severity', 'GREEN')
+        expl = info.get('explanation', '')[:80]
+        channel_rows.append(
+            f'<div class="ch-row">'
+            f'<div class="ch-name">{ch_name}</div>'
+            f'<div class="ch-sev det-{sev}">{sev}</div>'
+            f'<div style="flex:1">{_html.escape(expl)}</div>'
+            f'</div>'
+        )
+
+    n_char_spans = len(char_spans)
+    n_hot = sum(1 for s in spans if s.get('type') == 'hot_window')
+    span_summary = f"{n_char_spans} character spans"
+    if n_hot:
+        span_summary += f", {n_hot} hot windows"
+
+    report = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>BEET Detection Report — {_html.escape(task_id)}</title>
+<style>{_HTML_CSS}</style></head><body>
+<div class="header">
+    <div class="det det-{det}">{det}</div>
+    <div class="meta">
+        Task: {_html.escape(task_id)} | Words: {word_count} |
+        Confidence: {confidence:.1%} |
+        Mode: {result.get('mode', '?')} |
+        Spans: {span_summary}
+    </div>
+    <div class="meta" style="margin-top:4px">{_html.escape(reason[:200])}</div>
+</div>
+<div class="text-container">{highlighted}</div>
+<div class="legend">
+    <strong>Legend:</strong>
+    <span class="signal signal-CRITICAL">CRITICAL</span>
+    <span class="signal signal-HIGH">HIGH</span>
+    <span class="signal signal-MEDIUM">MEDIUM</span>
+    <span class="signal signal-LOW">LOW (fingerprint/lexicon)</span>
+</div>
+<div class="channels">
+    <h3>Channel Scores</h3>
+    {''.join(channel_rows)}
+</div>
+</body></html>"""
+
+    if output_path:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(report)
+        return output_path
+
+    return report
 
 
 # ==============================================================================
@@ -5046,6 +5429,10 @@ def main():
                         help='Build calibration table from labeled baseline JSONL and save to --cal-table')
     parser.add_argument('--cal-table', metavar='JSON',
                         help='Path to calibration table JSON (load for scoring, or save target for --calibrate)')
+    parser.add_argument('--cost-per-prompt', type=float, default=400.0,
+                        help='Cost per prompt for financial impact estimate (default: $400)')
+    parser.add_argument('--html-report', metavar='DIR',
+                        help='Generate HTML reports for flagged submissions in DIR')
     args = parser.parse_args()
 
     if args.gui:
@@ -5181,7 +5568,27 @@ def main():
     else:
         sim_pairs = []
 
-    default_name = os.path.basename(args.input).rsplit('.', 1)[0] + '_pipeline_v061.csv'
+    # Attempter profiling
+    if len(results) >= 5:
+        profiles = profile_attempters(results)
+        print_attempter_report(profiles)
+
+    # Financial impact
+    if len(results) >= 10:
+        impact = financial_impact(results, cost_per_prompt=args.cost_per_prompt)
+        print_financial_report(impact, cost_per_prompt=args.cost_per_prompt)
+
+    # HTML reports for flagged submissions
+    if getattr(args, 'html_report', None) and flagged:
+        os.makedirs(args.html_report, exist_ok=True)
+        for r in flagged:
+            tid = r.get('task_id', 'unknown')[:20]
+            path = os.path.join(args.html_report, f"{tid}_{r['determination']}.html")
+            generate_html_report(
+                text_map.get(r.get('task_id', ''), ''), r, path)
+        print(f"\n  HTML reports written to {args.html_report}/ ({len(flagged)} files)")
+
+    default_name = os.path.basename(args.input).rsplit('.', 1)[0] + '_pipeline_v065.csv'
     input_dir = os.path.dirname(os.path.abspath(args.input))
     output_path = args.output or os.path.join(input_dir, default_name)
 
