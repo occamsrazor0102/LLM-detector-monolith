@@ -21,7 +21,7 @@ def check(label, condition, detail=""):
 
 def test_think_tags():
     print("\n-- Think tag detection --")
-    score, sev, hits = run_preamble(
+    score, sev, hits, _spans = run_preamble(
         "<think>\nThe user wants a pharmacist task...\n</think>\n"
         "You are a board-certified pharmacist."
     )
@@ -33,7 +33,7 @@ def test_think_tags():
 
 def test_reasoning_tags():
     print("\n-- Reasoning tag detection --")
-    score, sev, hits = run_preamble(
+    score, sev, hits, _spans = run_preamble(
         "<reasoning>I need to design a complex scenario</reasoning>\n"
         "You are a senior data analyst."
     )
@@ -42,7 +42,7 @@ def test_reasoning_tags():
 
 def test_think_tag_mid_document():
     print("\n-- Think tag mid-document --")
-    score, sev, hits = run_preamble(
+    score, sev, hits, _spans = run_preamble(
         "You are a pharmacist. <think>Let me design this carefully.</think> "
         "Review the following prescription orders."
     )
@@ -51,7 +51,7 @@ def test_think_tag_mid_document():
 
 def test_self_correction():
     print("\n-- Self-correction phrases --")
-    score, sev, hits = run_preamble(
+    score, sev, hits, _spans = run_preamble(
         "Wait, actually let me rethink the constraints for this task. "
         "You must process each CSV row and validate all fields."
     )
@@ -61,7 +61,7 @@ def test_self_correction():
 
 def test_hmm_self_correction():
     print("\n-- Hmm self-correction --")
-    score, sev, hits = run_preamble(
+    score, sev, hits, _spans = run_preamble(
         "Hmm, let me reconsider the approach here. "
         "The task should require the analyst to cross-reference two datasets."
     )
@@ -70,7 +70,7 @@ def test_hmm_self_correction():
 
 def test_final_answer():
     print("\n-- Final answer phrase --")
-    score, sev, hits = run_preamble(
+    score, sev, hits, _spans = run_preamble(
         "My final answer is the following task prompt: "
         "You are a compliance officer reviewing internal audit reports."
     )
@@ -79,7 +79,7 @@ def test_final_answer():
 
 def test_step_numbering():
     print("\n-- Step numbering (MEDIUM) --")
-    score, sev, hits = run_preamble(
+    score, sev, hits, _spans = run_preamble(
         "Step 1: Review the patient chart.\n"
         "Step 2: Identify medication interactions.\n"
         "Step 3: Document findings in the report."
@@ -90,7 +90,7 @@ def test_step_numbering():
 
 def test_no_false_positive_think():
     print("\n-- No false positive on 'think carefully' --")
-    score, sev, hits = run_preamble(
+    score, sev, hits, _spans = run_preamble(
         "Think carefully about edge cases when reviewing patient records. "
         "You are a clinical pharmacist reviewing medication orders."
     )
@@ -99,7 +99,7 @@ def test_no_false_positive_think():
 
 def test_no_false_positive_plain_task():
     print("\n-- No false positive on plain task prompt --")
-    score, sev, hits = run_preamble(
+    score, sev, hits, _spans = run_preamble(
         "You are a data analyst. Use the attached CSV to create a summary report. "
         "Include charts for quarterly revenue trends."
     )

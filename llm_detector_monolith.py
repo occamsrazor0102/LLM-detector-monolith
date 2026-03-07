@@ -18,6 +18,7 @@ import sys
 import json
 import math
 import zlib
+import hashlib
 import statistics
 import unicodedata
 import threading
@@ -706,6 +707,8 @@ _BASELINE_FIELDS = [
     'window_fw_trajectory_cv', 'window_comp_trajectory_mean', 'window_comp_trajectory_cv',
     'tocsin_cohesiveness', 'tocsin_determination', 'tocsin_confidence',
     'surprisal_trajectory_cv', 'surprisal_stationarity',
+    # v0.65 addendum: similarity feedback
+    'similarity_upgraded',
 ]
 
 
@@ -904,22 +907,131 @@ def _structural_similarity(r1, r2):
     return 1.0 / (1.0 + math.sqrt(diff_sq))
 
 
-def analyze_similarity(results, text_map, jaccard_threshold=0.40, struct_threshold=0.90):
-    """Analyze cross-submission similarity within occupation groups."""
+def _adaptive_thresholds(group, shingle_cache, jaccard_threshold, struct_threshold):
+    """Compute adaptive similarity thresholds from occupation group distribution.
+
+    Uses median + 2*std of all pairwise scores within the group. Falls back
+    to flat thresholds when fewer than 4 results are available.
+    """
+    if len(group) < 4:
+        return jaccard_threshold, struct_threshold
+
+    jac_vals = []
+    struct_vals = []
+    for i in range(len(group)):
+        for j in range(i + 1, len(group)):
+            tid_a = group[i].get('task_id', '')
+            tid_b = group[j].get('task_id', '')
+            jac_vals.append(_jaccard(
+                shingle_cache.get(tid_a, set()),
+                shingle_cache.get(tid_b, set()),
+            ))
+            struct_vals.append(_structural_similarity(group[i], group[j]))
+
+    if len(jac_vals) < 3:
+        return jaccard_threshold, struct_threshold
+
+    med_jac = statistics.median(jac_vals)
+    std_jac = statistics.stdev(jac_vals) if len(jac_vals) >= 2 else 0.0
+    med_struct = statistics.median(struct_vals)
+    std_struct = statistics.stdev(struct_vals) if len(struct_vals) >= 2 else 0.0
+
+    adj_jac = max(med_jac + 2 * std_jac, 0.15)
+    adj_struct = max(med_struct + 2 * std_struct, 0.50)
+
+    # Never exceed user-specified thresholds
+    adj_jac = min(adj_jac, jaccard_threshold)
+    adj_struct = min(adj_struct, struct_threshold)
+
+    return adj_jac, adj_struct
+
+
+def _minhash_signature(shingles, n_hashes=128):
+    """Compute MinHash signature for a set of shingles (pure Python, zero deps)."""
+    sig = [float('inf')] * n_hashes
+    for shingle in shingles:
+        s = ' '.join(shingle) if isinstance(shingle, tuple) else str(shingle)
+        for i in range(n_hashes):
+            h = int(hashlib.md5(f"{i}:{s}".encode()).hexdigest(), 16)
+            sig[i] = min(sig[i], h)
+    return sig
+
+
+def _minhash_jaccard(sig_a, sig_b):
+    """Estimate Jaccard similarity from two MinHash signatures."""
+    if not sig_a or not sig_b or len(sig_a) != len(sig_b):
+        return 0.0
+    return sum(a == b for a, b in zip(sig_a, sig_b)) / len(sig_a)
+
+
+def _load_minhash_store(path):
+    """Load MinHash fingerprint store from JSONL file."""
+    entries = []
+    if not os.path.exists(path):
+        return entries
+    with open(path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                entries.append(json.loads(line))
+    return entries
+
+
+def _store_minhash(entries, path):
+    """Append MinHash fingerprint entries to JSONL file."""
+    with open(path, 'a') as f:
+        for entry in entries:
+            f.write(json.dumps(entry) + '\n')
+
+
+def _factor_instructions(shingles, instruction_shingles):
+    """Remove instruction-derived shingles from a submission's shingle set."""
+    if not instruction_shingles:
+        return shingles
+    return shingles - instruction_shingles
+
+
+def analyze_similarity(results, text_map, jaccard_threshold=0.40, struct_threshold=0.90,
+                       semantic=False, instruction_shingles=None, similarity_store_path=None):
+    """Analyze cross-submission similarity within occupation groups.
+
+    Supports adaptive thresholds (FEAT 11), semantic embeddings (FEAT 12),
+    cross-batch MinHash store (FEAT 14), and instruction factoring (FEAT 15).
+    """
     by_occ = defaultdict(list)
     for r in results:
         occ = r.get('occupation', '(unknown)')
         by_occ[occ].append(r)
 
+    # Build shingle cache with optional instruction factoring (FEAT 15)
     shingle_cache = {}
     for tid, text in text_map.items():
-        shingle_cache[tid] = _word_shingles(text)
+        s = _word_shingles(text)
+        if instruction_shingles:
+            s = _factor_instructions(s, instruction_shingles)
+        shingle_cache[tid] = s
+
+    # Build embedding cache for semantic similarity (FEAT 12)
+    embedding_cache = {}
+    if semantic and HAS_SEMANTIC:
+        _ensure_semantic()
+        all_tids = [r.get('task_id', '') for r in results
+                    if r.get('task_id', '') in text_map]
+        all_texts = [text_map[tid] for tid in all_tids]
+        if all_texts:
+            all_vecs = _EMBEDDER.encode(all_texts)
+            for tid, vec in zip(all_tids, all_vecs):
+                embedding_cache[tid] = vec
 
     flagged_pairs = []
 
     for occ, group in by_occ.items():
         if len(group) < 2:
             continue
+
+        # FEAT 11: adaptive thresholds per occupation group
+        jac_thresh, str_thresh = _adaptive_thresholds(
+            group, shingle_cache, jaccard_threshold, struct_threshold)
 
         for i in range(len(group)):
             for j in range(i + 1, len(group)):
@@ -939,11 +1051,19 @@ def analyze_similarity(results, text_map, jaccard_threshold=0.40, struct_thresho
                 )
                 struct = _structural_similarity(r_a, r_b)
 
+                # FEAT 12: semantic embedding similarity
+                sem = 0.0
+                if semantic and tid_a in embedding_cache and tid_b in embedding_cache:
+                    sem = float(_cosine_similarity(
+                        [embedding_cache[tid_a]], [embedding_cache[tid_b]])[0][0])
+
                 flags = []
-                if jac >= jaccard_threshold:
+                if jac >= jac_thresh:
                     flags.append('text')
-                if struct >= struct_threshold:
+                if struct >= str_thresh:
                     flags.append('structural')
+                if sem >= 0.85:
+                    flags.append('semantic')
 
                 if flags:
                     flagged_pairs.append({
@@ -954,13 +1074,125 @@ def analyze_similarity(results, text_map, jaccard_threshold=0.40, struct_thresho
                         'occupation': occ,
                         'jaccard': jac,
                         'structural': struct,
+                        'semantic': sem,
                         'flag_type': '+'.join(flags),
                         'det_a': r_a['determination'],
                         'det_b': r_b['determination'],
+                        'adaptive_jac_threshold': jac_thresh,
+                        'adaptive_struct_threshold': str_thresh,
                     })
+
+    # FEAT 14: cross-batch MinHash store
+    if similarity_store_path:
+        stored = _load_minhash_store(similarity_store_path)
+
+        # Compare current batch against stored fingerprints
+        for r in results:
+            tid = r.get('task_id', '')
+            occ = r.get('occupation', '(unknown)')
+            att = r.get('attempter', '').strip().lower()
+            shingles = shingle_cache.get(tid, set())
+            if not shingles:
+                continue
+            sig = _minhash_signature(shingles)
+            for entry in stored:
+                if entry.get('occupation', '') != occ:
+                    continue
+                stored_att = entry.get('attempter', '').strip().lower()
+                if stored_att and att and stored_att == att:
+                    continue
+                est_jac = _minhash_jaccard(sig, entry.get('minhash', []))
+                if est_jac >= max(jaccard_threshold * 0.8, 0.12):
+                    flagged_pairs.append({
+                        'id_a': tid,
+                        'id_b': entry.get('task_id', ''),
+                        'attempter_a': r.get('attempter', ''),
+                        'attempter_b': entry.get('attempter', ''),
+                        'occupation': occ,
+                        'jaccard': est_jac,
+                        'structural': 0.0,
+                        'semantic': 0.0,
+                        'flag_type': 'cross-batch',
+                        'det_a': r.get('determination', ''),
+                        'det_b': entry.get('determination', ''),
+                        'adaptive_jac_threshold': jaccard_threshold,
+                        'adaptive_struct_threshold': struct_threshold,
+                    })
+
+        # Store current batch fingerprints
+        from datetime import datetime as _dt
+        new_entries = []
+        for r in results:
+            tid = r.get('task_id', '')
+            shingles = shingle_cache.get(tid, set())
+            if not shingles:
+                continue
+            new_entries.append({
+                'task_id': tid,
+                'attempter': r.get('attempter', ''),
+                'occupation': r.get('occupation', '(unknown)'),
+                'determination': r.get('determination', ''),
+                'minhash': _minhash_signature(shingles),
+                'timestamp': _dt.now().isoformat(),
+            })
+        if new_entries:
+            _store_minhash(new_entries, similarity_store_path)
 
     flagged_pairs.sort(key=lambda p: p['jaccard'], reverse=True)
     return flagged_pairs
+
+
+def apply_similarity_feedback(results, sim_pairs):
+    """Post-hoc upgrade YELLOW -> AMBER when similarity confirms template reuse (FEAT 13).
+
+    Returns count of upgraded determinations.
+    """
+    result_map = {}
+    for r in results:
+        tid = r.get('task_id', '')
+        if tid:
+            result_map[tid] = r
+
+    n_upgrades = 0
+    for pair in sim_pairs:
+        # Only act on meaningful similarity signals
+        flag_type = pair.get('flag_type', '')
+        has_semantic = 'semantic' in flag_type
+        has_text = 'text' in flag_type
+        if not has_semantic and not has_text:
+            continue
+
+        r_a = result_map.get(pair['id_a'])
+        r_b = result_map.get(pair['id_b'])
+        if not r_a or not r_b:
+            continue
+
+        det_a = r_a.get('determination', '')
+        det_b = r_b.get('determination', '')
+
+        # Case 1: one YELLOW paired with RED/AMBER → upgrade YELLOW to AMBER
+        if det_a == 'YELLOW' and det_b in ('RED', 'AMBER'):
+            r_a['determination'] = 'AMBER'
+            r_a['reason'] = r_a.get('reason', '') + f" [upgraded: similarity with {pair['id_b']}]"
+            r_a['similarity_upgraded'] = True
+            n_upgrades += 1
+        if det_b == 'YELLOW' and det_a in ('RED', 'AMBER'):
+            r_b['determination'] = 'AMBER'
+            r_b['reason'] = r_b.get('reason', '') + f" [upgraded: similarity with {pair['id_a']}]"
+            r_b['similarity_upgraded'] = True
+            n_upgrades += 1
+
+        # Case 2: both YELLOW and high semantic → upgrade both to AMBER
+        if det_a == 'YELLOW' and det_b == 'YELLOW' and pair.get('semantic', 0) >= 0.90:
+            r_a['determination'] = 'AMBER'
+            r_a['reason'] = r_a.get('reason', '') + f" [upgraded: mutual similarity with {pair['id_b']}]"
+            r_a['similarity_upgraded'] = True
+            r_b['determination'] = 'AMBER'
+            r_b['reason'] = r_b.get('reason', '') + f" [upgraded: mutual similarity with {pair['id_a']}]"
+            r_b['similarity_upgraded'] = True
+            n_upgrades += 2
+
+    return n_upgrades
 
 
 def print_similarity_report(pairs):
@@ -975,10 +1207,600 @@ def print_similarity_report(pairs):
 
     for p in pairs:
         icon = 'RED' if p['jaccard'] >= 0.70 else 'AMBER' if p['jaccard'] >= 0.50 else 'YELLOW'
-        print(f"\n  [{icon}] Jaccard={p['jaccard']:.2f}  Struct={p['structural']:.2f}  [{p['flag_type']}]")
+        prefix = '[CROSS-BATCH] ' if p.get('flag_type') == 'cross-batch' else ''
+        sem_str = f"  Sem={p['semantic']:.2f}" if p.get('semantic', 0) > 0 else ''
+        print(f"\n  {prefix}[{icon}] Jaccard={p['jaccard']:.2f}  Struct={p['structural']:.2f}{sem_str}  [{p['flag_type']}]")
         print(f"     {p['id_a'][:15]:15s} ({p['attempter_a'] or '?':20s}) [{p['det_a']}]")
         print(f"     {p['id_b'][:15]:15s} ({p['attempter_b'] or '?':20s}) [{p['det_b']}]")
         print(f"     Occupation: {p['occupation'][:50]}")
+
+# ==============================================================================
+# HISTORICAL MEMORY STORE
+# Unified persistence layer for cross-batch detection memory.
+# All data lives in a single directory (default .beet/).
+# ==============================================================================
+
+from pathlib import Path as _Path
+import shutil as _shutil
+
+
+class MemoryStore:
+    """Persistent memory for the BEET detection pipeline.
+
+    Usage:
+        store = MemoryStore('.beet/')
+        store.record_batch(results, text_map, batch_id='batch_001')
+        history = store.get_attempter_history('worker_42')
+        cross_matches = store.cross_batch_similarity(results, text_map)
+        store.record_confirmation('task_001', 'ai', verified_by='reviewer_A')
+    """
+
+    def __init__(self, store_dir='.beet'):
+        self.store_dir = _Path(store_dir)
+        self.store_dir.mkdir(parents=True, exist_ok=True)
+        (self.store_dir / 'calibration_history').mkdir(exist_ok=True)
+
+        self.submissions_path = self.store_dir / 'submissions.jsonl'
+        self.fingerprints_path = self.store_dir / 'fingerprints.jsonl'
+        self.attempters_path = self.store_dir / 'attempters.jsonl'
+        self.confirmed_path = self.store_dir / 'confirmed.jsonl'
+        self.calibration_path = self.store_dir / 'calibration.json'
+        self.config_path = self.store_dir / 'config.json'
+
+        self._config = self._load_config()
+
+    # ── Config ────────────────────────────────────────────────────
+
+    def _load_config(self):
+        if self.config_path.exists():
+            with open(self.config_path) as f:
+                return json.load(f)
+        return {
+            'version': '0.65',
+            'created': datetime.now().isoformat(),
+            'last_updated': datetime.now().isoformat(),
+            'total_submissions': 0,
+            'total_batches': 0,
+            'total_attempters': 0,
+            'total_confirmed': 0,
+            'occupations': [],
+        }
+
+    def _save_config(self):
+        self._config['last_updated'] = datetime.now().isoformat()
+        with open(self.config_path, 'w') as f:
+            json.dump(self._config, f, indent=2)
+
+    # ── Batch Recording ──────────────────────────────────────────
+
+    def record_batch(self, results, text_map, batch_id=None):
+        """Record a full batch of pipeline results to memory.
+
+        Updates submissions, fingerprints, attempter profiles, and config.
+        """
+        if batch_id is None:
+            batch_id = f"batch_{datetime.now().strftime('%Y-%m-%d_%H:%M')}"
+
+        timestamp = datetime.now().isoformat()
+        n_written = 0
+
+        # Write submissions
+        with open(self.submissions_path, 'a') as f:
+            for r in results:
+                record = {k: r.get(k) for k in _BASELINE_FIELDS}
+                record['batch_id'] = batch_id
+                record['timestamp'] = timestamp
+                record['pipeline_version'] = r.get('audit_trail', {}).get(
+                    'pipeline_version', 'unknown')
+                record['similarity_partners'] = r.get('similarity_partners', 0)
+                record['similarity_max_semantic'] = r.get('similarity_max_semantic', 0.0)
+                wc = r.get('word_count', 0)
+                if wc < 100:
+                    record['length_bin'] = 'short'
+                elif wc < 300:
+                    record['length_bin'] = 'medium'
+                elif wc < 800:
+                    record['length_bin'] = 'long'
+                else:
+                    record['length_bin'] = 'very_long'
+                f.write(json.dumps(record, default=str) + '\n')
+                n_written += 1
+
+        # Write fingerprints
+        self._write_fingerprints(results, text_map, batch_id)
+
+        # Update attempter profiles
+        self._update_attempter_profiles(results, batch_id, timestamp)
+
+        # Update config
+        self._config['total_submissions'] += n_written
+        self._config['total_batches'] += 1
+        occs = set(self._config.get('occupations', []))
+        for r in results:
+            occ = r.get('occupation', '')
+            if occ:
+                occs.add(occ)
+        self._config['occupations'] = sorted(occs)
+        self._save_config()
+
+        print(f"  Memory: {n_written} submissions recorded to {self.store_dir}/")
+        return n_written
+
+    def _write_fingerprints(self, results, text_map, batch_id):
+        """Write MinHash and optional embedding fingerprints."""
+        # Pre-compute embeddings if available
+        embeddings = {}
+        if HAS_SEMANTIC:
+            _ensure_semantic()
+            texts = []
+            tids = []
+            for r in results:
+                tid = r.get('task_id', '')
+                text = text_map.get(tid, '')
+                if text:
+                    texts.append(text)
+                    tids.append(tid)
+            if texts:
+                raw_embeds = _EMBEDDER.encode(texts)
+                for tid, emb in zip(tids, raw_embeds):
+                    embeddings[tid] = [round(float(v), 5) for v in emb[:64]]
+
+        with open(self.fingerprints_path, 'a') as f:
+            for r in results:
+                tid = r.get('task_id', '')
+                text = text_map.get(tid, '')
+                if not text:
+                    continue
+
+                shingles = _word_shingles(text)
+                minhash = _minhash_signature(shingles)
+
+                struct_vec = {feat: r.get(feat, 0) for feat in _STRUCT_FEATURES}
+
+                record = {
+                    'task_id': tid,
+                    'attempter': r.get('attempter', ''),
+                    'occupation': r.get('occupation', ''),
+                    'batch_id': batch_id,
+                    'determination': r.get('determination', ''),
+                    'minhash_128': minhash,
+                    'structural_vec': struct_vec,
+                }
+
+                if tid in embeddings:
+                    record['embedding_64'] = embeddings[tid]
+
+                f.write(json.dumps(record, default=str) + '\n')
+
+    # ── Attempter Profiles ───────────────────────────────────────
+
+    def _update_attempter_profiles(self, results, batch_id, timestamp):
+        """Update rolling attempter profiles with new batch results."""
+        profiles = self._load_attempter_profiles()
+
+        by_att = defaultdict(list)
+        for r in results:
+            att = r.get('attempter', '').strip()
+            if att:
+                by_att[att].append(r)
+
+        for att, submissions in by_att.items():
+            if att not in profiles:
+                profiles[att] = {
+                    'attempter': att,
+                    'total_submissions': 0,
+                    'determinations': {'RED': 0, 'AMBER': 0, 'YELLOW': 0,
+                                       'GREEN': 0, 'MIXED': 0, 'REVIEW': 0},
+                    'confirmed_ai': 0,
+                    'confirmed_human': 0,
+                    'occupations': [],
+                    'batches': [],
+                    'first_seen': timestamp,
+                    'feature_sums': {},
+                    'feature_counts': 0,
+                }
+
+            p = profiles[att]
+            p['total_submissions'] += len(submissions)
+            p['last_seen'] = timestamp
+            p['last_updated'] = timestamp
+
+            if batch_id not in p['batches']:
+                p['batches'].append(batch_id)
+
+            for r in submissions:
+                det = r.get('determination', 'GREEN')
+                p['determinations'][det] = p['determinations'].get(det, 0) + 1
+
+                occ = r.get('occupation', '')
+                if occ and occ not in p['occupations']:
+                    p['occupations'].append(occ)
+
+                for feat in ['prompt_signature_cfd', 'instruction_density_idi',
+                             'voice_dissonance_vsd', 'voice_dissonance_spec_score',
+                             'self_similarity_nssi_score']:
+                    val = r.get(feat, 0)
+                    if val:
+                        if feat not in p['feature_sums']:
+                            p['feature_sums'][feat] = 0.0
+                        p['feature_sums'][feat] += val
+
+                p['feature_counts'] += 1
+
+            # Compute derived fields
+            total = p['total_submissions']
+            flagged = (p['determinations'].get('RED', 0) +
+                       p['determinations'].get('AMBER', 0) +
+                       p['determinations'].get('MIXED', 0))
+            p['flag_rate'] = round(flagged / max(total, 1), 3)
+
+            if p['feature_counts'] > 0:
+                p['mean_features'] = {
+                    k: round(v / p['feature_counts'], 3)
+                    for k, v in p['feature_sums'].items()
+                }
+
+            # Risk tier
+            p['risk_tier'] = self._compute_risk_tier(p)
+
+            # Primary detection channel
+            channel_counts = Counter()
+            for r in submissions:
+                if r.get('determination') in ('RED', 'AMBER', 'MIXED'):
+                    cd = r.get('channel_details', {})
+                    if isinstance(cd, dict):
+                        channels = cd.get('channels', {})
+                        for ch, info in channels.items():
+                            if isinstance(info, dict) and info.get('severity') in ('RED', 'AMBER'):
+                                channel_counts[ch] += 1
+            if channel_counts:
+                p['primary_detection_channel'] = channel_counts.most_common(1)[0][0]
+
+        self._save_attempter_profiles(profiles)
+        self._config['total_attempters'] = len(profiles)
+
+    @staticmethod
+    def _compute_risk_tier(profile):
+        """Compute risk tier from flag rate and confirmation history."""
+        flag_rate = profile.get('flag_rate', 0)
+        confirmed_ai = profile.get('confirmed_ai', 0)
+        if confirmed_ai > 0 and flag_rate > 0.50:
+            return 'CRITICAL'
+        elif flag_rate > 0.30 or confirmed_ai > 0:
+            return 'HIGH'
+        elif flag_rate > 0.15:
+            return 'ELEVATED'
+        else:
+            return 'NORMAL'
+
+    def _load_attempter_profiles(self):
+        """Load attempter profiles dict."""
+        profiles = {}
+        if self.attempters_path.exists():
+            with open(self.attempters_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            p = json.loads(line)
+                            profiles[p['attempter']] = p
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+        return profiles
+
+    def _save_attempter_profiles(self, profiles):
+        """Save attempter profiles (full rewrite)."""
+        with open(self.attempters_path, 'w') as f:
+            for p in sorted(profiles.values(),
+                            key=lambda x: x.get('flag_rate', 0), reverse=True):
+                f.write(json.dumps(p, default=str) + '\n')
+
+    # ── Queries ──────────────────────────────────────────────────
+
+    def get_attempter_history(self, attempter):
+        """Get full history for a specific attempter."""
+        profiles = self._load_attempter_profiles()
+        profile = profiles.get(attempter.strip())
+
+        submissions = []
+        if self.submissions_path.exists():
+            with open(self.submissions_path) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line.strip())
+                        if rec.get('attempter', '').strip() == attempter.strip():
+                            submissions.append(rec)
+                    except json.JSONDecodeError:
+                        continue
+
+        confirmations = []
+        if self.confirmed_path.exists():
+            with open(self.confirmed_path) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line.strip())
+                        if rec.get('attempter', '').strip() == attempter.strip():
+                            confirmations.append(rec)
+                    except json.JSONDecodeError:
+                        continue
+
+        return {
+            'profile': profile,
+            'submissions': submissions,
+            'confirmations': confirmations,
+        }
+
+    def get_attempter_risk_report(self, min_submissions=2):
+        """Get all attempters ranked by risk tier and flag rate."""
+        profiles = self._load_attempter_profiles()
+        tier_rank = {'CRITICAL': 4, 'HIGH': 3, 'ELEVATED': 2, 'NORMAL': 1}
+        return sorted(
+            [p for p in profiles.values()
+             if p.get('total_submissions', 0) >= min_submissions],
+            key=lambda p: (-tier_rank.get(p.get('risk_tier', 'NORMAL'), 0),
+                           -p.get('flag_rate', 0)),
+        )
+
+    def get_occupation_baselines(self, occupation):
+        """Get historical feature distributions for an occupation."""
+        submissions = []
+        if self.submissions_path.exists():
+            with open(self.submissions_path) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line.strip())
+                        if rec.get('occupation', '') == occupation:
+                            submissions.append(rec)
+                    except json.JSONDecodeError:
+                        continue
+        return submissions
+
+    def pre_batch_context(self, attempter=None, occupation=None):
+        """Retrieve historical context before running a batch."""
+        context = {}
+
+        if attempter:
+            profiles = self._load_attempter_profiles()
+            profile = profiles.get(attempter.strip())
+            if profile:
+                context['attempter_risk_tier'] = profile.get('risk_tier', 'UNKNOWN')
+                context['attempter_flag_rate'] = profile.get('flag_rate', 0)
+                context['attempter_total'] = profile.get('total_submissions', 0)
+                context['attempter_confirmed_ai'] = profile.get('confirmed_ai', 0)
+
+        if occupation:
+            subs = self.get_occupation_baselines(occupation)
+            if len(subs) >= 5:
+                cfd_values = [s.get('prompt_signature_cfd', 0) for s in subs]
+                idi_values = [s.get('instruction_density_idi', 0) for s in subs]
+                context['occupation_n'] = len(subs)
+                context['occupation_median_cfd'] = round(
+                    statistics.median(cfd_values), 3)
+                context['occupation_median_idi'] = round(
+                    statistics.median(idi_values), 3)
+
+        return context
+
+    # ── Cross-Batch Similarity ───────────────────────────────────
+
+    def cross_batch_similarity(self, current_results, text_map,
+                               minhash_threshold=0.50):
+        """Compare current batch against historical fingerprints."""
+        historical = []
+        if self.fingerprints_path.exists():
+            with open(self.fingerprints_path) as f:
+                for line in f:
+                    try:
+                        historical.append(json.loads(line.strip()))
+                    except json.JSONDecodeError:
+                        continue
+
+        if not historical:
+            return []
+
+        flags = []
+        for r in current_results:
+            tid = r.get('task_id', '')
+            text = text_map.get(tid, '')
+            if not text:
+                continue
+
+            current_minhash = _minhash_signature(_word_shingles(text))
+
+            for hist in historical:
+                if hist.get('task_id') == tid:
+                    continue
+
+                att_curr = r.get('attempter', '').strip().lower()
+                att_hist = hist.get('attempter', '').strip().lower()
+                if att_curr and att_hist and att_curr == att_hist:
+                    continue
+
+                mh_sim = _minhash_jaccard(
+                    current_minhash, hist.get('minhash_128', []))
+
+                if mh_sim >= minhash_threshold:
+                    flags.append({
+                        'current_id': tid,
+                        'historical_id': hist['task_id'],
+                        'current_attempter': r.get('attempter', ''),
+                        'historical_attempter': hist.get('attempter', ''),
+                        'occupation': r.get('occupation', ''),
+                        'minhash_similarity': round(mh_sim, 3),
+                        'historical_determination': hist.get('determination', '?'),
+                        'historical_batch': hist.get('batch_id', '?'),
+                    })
+
+        flags.sort(key=lambda f: f['minhash_similarity'], reverse=True)
+        return flags
+
+    # ── Confirmation Feedback ────────────────────────────────────
+
+    def record_confirmation(self, task_id, ground_truth, verified_by='',
+                            notes=''):
+        """Record a human-verified ground truth label."""
+        # Find the original submission
+        original = None
+        if self.submissions_path.exists():
+            with open(self.submissions_path) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line.strip())
+                        if rec.get('task_id') == task_id:
+                            original = rec
+                            break
+                    except json.JSONDecodeError:
+                        continue
+
+        record = {
+            'task_id': task_id,
+            'ground_truth': ground_truth,
+            'verified_by': verified_by,
+            'verified_at': datetime.now().isoformat(),
+            'notes': notes,
+        }
+
+        if original:
+            record['attempter'] = original.get('attempter', '')
+            record['occupation'] = original.get('occupation', '')
+            record['pipeline_determination'] = original.get('determination', '')
+            record['pipeline_confidence'] = original.get('confidence', 0)
+
+        with open(self.confirmed_path, 'a') as f:
+            f.write(json.dumps(record, default=str) + '\n')
+
+        # Update attempter profile
+        if original and original.get('attempter'):
+            profiles = self._load_attempter_profiles()
+            att = original['attempter'].strip()
+            if att in profiles:
+                if ground_truth == 'ai':
+                    profiles[att]['confirmed_ai'] = profiles[att].get(
+                        'confirmed_ai', 0) + 1
+                else:
+                    profiles[att]['confirmed_human'] = profiles[att].get(
+                        'confirmed_human', 0) + 1
+                profiles[att]['risk_tier'] = self._compute_risk_tier(profiles[att])
+                self._save_attempter_profiles(profiles)
+
+        self._config['total_confirmed'] = self._config.get(
+            'total_confirmed', 0) + 1
+        self._save_config()
+
+        print(f"  Confirmed: {task_id} = {ground_truth} (by {verified_by})")
+
+    # ── Calibration Integration ──────────────────────────────────
+
+    def rebuild_calibration(self):
+        """Rebuild calibration table from all confirmed human submissions."""
+        confirmed = {}
+        if self.confirmed_path.exists():
+            with open(self.confirmed_path) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line.strip())
+                        confirmed[rec['task_id']] = rec['ground_truth']
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+
+        if not confirmed:
+            print("  No confirmed labels — cannot rebuild calibration")
+            return None
+
+        import tempfile as _tempfile
+        with _tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl',
+                                          delete=False) as tmp:
+            if self.submissions_path.exists():
+                with open(self.submissions_path) as f:
+                    for line in f:
+                        try:
+                            rec = json.loads(line.strip())
+                            tid = rec.get('task_id', '')
+                            if tid in confirmed:
+                                rec['ground_truth'] = confirmed[tid]
+                                tmp.write(json.dumps(rec, default=str) + '\n')
+                        except json.JSONDecodeError:
+                            continue
+            tmp_path = tmp.name
+
+        cal = calibrate_from_baselines(tmp_path)
+        os.unlink(tmp_path)
+
+        if cal is None:
+            print("  Insufficient confirmed human data for calibration")
+            return None
+
+        # Snapshot current calibration before overwriting
+        if self.calibration_path.exists():
+            snapshot_name = f"cal_{datetime.now().strftime('%Y-%m-%d_%H%M')}.json"
+            snapshot_path = self.store_dir / 'calibration_history' / snapshot_name
+            _shutil.copy2(str(self.calibration_path), str(snapshot_path))
+
+        save_calibration(cal, str(self.calibration_path))
+        print(f"  Calibration rebuilt: {cal.get('n_calibration', 0)} labeled samples")
+        return cal
+
+    # ── Summary ──────────────────────────────────────────────────
+
+    def print_summary(self):
+        """Print memory store summary."""
+        c = self._config
+        print(f"\n  BEET Memory Store: {self.store_dir}/")
+        print(f"    Submissions: {c.get('total_submissions', 0)}")
+        print(f"    Batches:     {c.get('total_batches', 0)}")
+        print(f"    Attempters:  {c.get('total_attempters', 0)}")
+        print(f"    Confirmed:   {c.get('total_confirmed', 0)}")
+        occs = c.get('occupations', [])
+        if occs:
+            print(f"    Occupations: {', '.join(occs[:10])}"
+                  f"{'...' if len(occs) > 10 else ''}")
+        print(f"    Last update: {c.get('last_updated', 'never')}")
+
+
+def _print_attempter_history(history):
+    """Print formatted attempter history from memory store."""
+    profile = history.get('profile')
+    if not profile:
+        print("  No history found for this attempter.")
+        return
+
+    print(f"\n  ATTEMPTER: {profile['attempter']}")
+    print(f"    Risk tier:   {profile.get('risk_tier', 'UNKNOWN')}")
+    print(f"    Flag rate:   {profile.get('flag_rate', 0):.0%}")
+    print(f"    Submissions: {profile.get('total_submissions', 0)}")
+
+    dets = profile.get('determinations', {})
+    print(f"    R={dets.get('RED', 0)} A={dets.get('AMBER', 0)} "
+          f"Y={dets.get('YELLOW', 0)} G={dets.get('GREEN', 0)}")
+
+    if profile.get('confirmed_ai', 0) or profile.get('confirmed_human', 0):
+        print(f"    Confirmed: AI={profile.get('confirmed_ai', 0)} "
+              f"Human={profile.get('confirmed_human', 0)}")
+
+    occs = profile.get('occupations', [])
+    if occs:
+        print(f"    Occupations: {', '.join(occs[:5])}")
+
+    print(f"    First seen: {profile.get('first_seen', '?')}")
+    print(f"    Last seen:  {profile.get('last_seen', '?')}")
+    print(f"    Batches:    {len(profile.get('batches', []))}")
+
+    submissions = history.get('submissions', [])
+    if submissions:
+        print(f"\n    Recent submissions (last 10):")
+        for s in submissions[-10:]:
+            print(f"      {s.get('task_id', '?')[:15]:15} "
+                  f"[{s.get('determination', '?'):6}] "
+                  f"conf={s.get('confidence', 0):.2f} "
+                  f"{s.get('occupation', '')[:30]}")
+
+    confirmations = history.get('confirmations', [])
+    if confirmations:
+        print(f"\n    Confirmations ({len(confirmations)}):")
+        for c in confirmations:
+            print(f"      {c.get('task_id', '?')[:15]} = {c.get('ground_truth', '?')} "
+                  f"(by {c.get('verified_by', '?')})")
+
 
 # ==============================================================================
 # ANALYZER: PREAMBLE
@@ -1011,17 +1833,26 @@ PREAMBLE_PATTERNS = [
 
 
 def run_preamble(text):
-    """Detect LLM preamble artifacts. Returns (score, severity, hits)."""
+    """Detect LLM preamble artifacts. Returns (score, severity, hits, spans)."""
     first_500 = text[:500]
     hits = []
+    spans = []
     severity = 'NONE'
 
     for pat, name, sev in PREAMBLE_PATTERNS:
         search_text = first_500 if name in (
             'assistant_ack', 'artifact_delivery', 'first_person_creation', 'cot_leakage',
         ) else text
-        if re.search(pat, search_text):
+        match = re.search(pat, search_text)
+        if match:
             hits.append((name, sev))
+            spans.append({
+                'start': match.start(),
+                'end': match.end(),
+                'text': match.group()[:80],
+                'pattern': name,
+                'severity': sev,
+            })
             if sev == 'CRITICAL':
                 severity = 'CRITICAL'
             elif sev == 'HIGH' and severity not in ('CRITICAL',):
@@ -1030,7 +1861,7 @@ def run_preamble(text):
                 severity = 'MEDIUM'
 
     score = {'CRITICAL': 0.99, 'HIGH': 0.75, 'MEDIUM': 0.50, 'NONE': 0.0}[severity]
-    return score, severity, hits
+    return score, severity, hits, spans
 
 # ==============================================================================
 # ANALYZER: FINGERPRINT
@@ -1061,6 +1892,104 @@ def run_fingerprint(text):
     rate = hits / max(word_count / 1000, 1)
     score = min(rate / 5.0, 1.0)
     return score, hits, rate
+
+
+def collect_spans(text):
+    """Collect character-level spans from all regex-based detectors.
+
+    Returns a sorted list of dicts, each with:
+        start, end     – character offsets into *text*
+        text           – the matched substring
+        layer          – which detector family fired
+        pattern        – pattern identifier
+        severity       – CRITICAL / HIGH / MEDIUM / LOW
+        weight         – numeric weight (matches scoring weights where applicable)
+
+    Spans are purely diagnostic; they do not affect scoring.
+    """
+    spans = []
+
+    # --- Preamble patterns ---
+    first_500_names = {
+        'assistant_ack', 'artifact_delivery', 'first_person_creation', 'cot_leakage',
+    }
+    for pat_str, name, sev in PREAMBLE_PATTERNS:
+        search_text = text[:500] if name in first_500_names else text
+        for m in re.finditer(pat_str, search_text):
+            spans.append({
+                'start': m.start(),
+                'end': m.end(),
+                'text': m.group(),
+                'layer': 'preamble',
+                'pattern': name,
+                'severity': sev,
+                'weight': {'CRITICAL': 0.99, 'HIGH': 0.75, 'MEDIUM': 0.50}.get(sev, 0.0),
+            })
+
+    # --- Fingerprint words ---
+    for m in _FINGERPRINT_RE.finditer(text):
+        spans.append({
+            'start': m.start(),
+            'end': m.end(),
+            'text': m.group(),
+            'layer': 'fingerprint',
+            'pattern': 'fingerprint_word',
+            'severity': 'LOW',
+            'weight': 1.0,
+        })
+
+    # --- Formulaic academic phrases ---
+    for compiled_pat, weight in _FORMULAIC_PATTERNS:
+        for m in compiled_pat.finditer(text):
+            spans.append({
+                'start': m.start(),
+                'end': m.end(),
+                'text': m.group(),
+                'layer': 'formulaic',
+                'pattern': compiled_pat.pattern[:60],
+                'severity': 'MEDIUM',
+                'weight': weight,
+            })
+
+    # --- Power adjectives ---
+    for m in _POWER_ADJ.finditer(text):
+        spans.append({
+            'start': m.start(),
+            'end': m.end(),
+            'text': m.group(),
+            'layer': 'power_adj',
+            'pattern': 'power_adjective',
+            'severity': 'LOW',
+            'weight': 1.0,
+        })
+
+    # --- Transition connectors ---
+    for m in _TRANSITION.finditer(text):
+        spans.append({
+            'start': m.start(),
+            'end': m.end(),
+            'text': m.group(),
+            'layer': 'transition',
+            'pattern': 'transition_connector',
+            'severity': 'LOW',
+            'weight': 1.0,
+        })
+
+    # --- Demonstrative phrases ---
+    for m in _DEMONSTRATIVE.finditer(text):
+        spans.append({
+            'start': m.start(),
+            'end': m.end(),
+            'text': m.group(),
+            'layer': 'demonstrative',
+            'pattern': 'demonstrative_phrase',
+            'severity': 'LOW',
+            'weight': 1.0,
+        })
+
+    spans.sort(key=lambda s: s['start'])
+    return spans
+
 
 # ==============================================================================
 # ANALYZER: PROMPT SIGNATURE
@@ -3482,6 +4411,7 @@ class PackScore:
     raw_score: float = 0.0
     capped_score: float = 0.0
     matches: List[str] = field(default_factory=list)
+    spans: List[dict] = field(default_factory=list)
 
 
 def score_pack(text: str, pack_name: str, n_sentences: int = 1) -> PackScore:
@@ -3501,25 +4431,49 @@ def score_pack(text: str, pack_name: str, n_sentences: int = 1) -> PackScore:
 
     result = PackScore(pack_name=pack_name, category=pack.category)
 
-    # Pattern matching
+    # Pattern matching (finditer for span capture)
     for compiled_re, weight in compiled:
-        found = compiled_re.findall(text)
-        if found:
-            result.raw_hits += len(found)
-            result.weighted_hits += len(found) * weight
-            result.matches.extend(found[:3])  # Keep first 3 for diagnostics
+        for m in compiled_re.finditer(text):
+            result.raw_hits += 1
+            result.weighted_hits += weight
+            if len(result.matches) < 3:
+                result.matches.append(m.group())
+            result.spans.append({
+                'start': m.start(),
+                'end': m.end(),
+                'text': m.group()[:80],
+                'pack': pack_name,
+                'weight': weight,
+            })
 
-    # Keyword matching (fast path, no weight — counted separately)
+    # Keyword matching (finditer for span capture)
     kw_re = _KEYWORD_RES.get(pack_name)
     if kw_re:
-        result.keyword_hits = len(kw_re.findall(text))
+        for m in kw_re.finditer(text):
+            result.keyword_hits += 1
+            result.spans.append({
+                'start': m.start(),
+                'end': m.end(),
+                'text': m.group(),
+                'pack': pack_name,
+                'weight': 0.0,
+                'type': 'keyword',
+            })
 
-    # Uppercase keyword matching (case-sensitive)
+    # Uppercase keyword matching (case-sensitive, finditer for span capture)
     uc_re = _UPPERCASE_RES.get(pack_name)
     if uc_re:
-        result.uppercase_hits = len(uc_re.findall(text))
-        # Uppercase normative forms get bonus weight
-        result.weighted_hits += result.uppercase_hits * 2.0
+        for m in uc_re.finditer(text):
+            result.uppercase_hits += 1
+            result.weighted_hits += 2.0
+            result.spans.append({
+                'start': m.start(),
+                'end': m.end(),
+                'text': m.group(),
+                'pack': pack_name,
+                'weight': 2.0,
+                'type': 'uppercase',
+            })
 
     # Density-normalized score: weighted_hits per sentence × family_weight
     density = result.weighted_hits / n_sents
@@ -3829,6 +4783,10 @@ def run_prompt_signature_enhanced(text: str, base_result: Optional[dict] = None)
             for name, s in all_pack_scores.items()
             if s.raw_hits > 0
         },
+        'pack_spans': sorted(
+            [sp for s in all_pack_scores.values() for sp in s.spans],
+            key=lambda x: x['start'],
+        ),
     })
 
     return result
@@ -3892,6 +4850,10 @@ def run_voice_dissonance_enhanced(text: str, base_result: Optional[dict] = None)
             for name, s in all_pack_scores.items()
             if s.raw_hits > 0
         },
+        'pack_spans': sorted(
+            [sp for s in all_pack_scores.values() for sp in s.spans],
+            key=lambda x: x['start'],
+        ),
     })
 
     return result
@@ -3946,6 +4908,10 @@ def run_instruction_density_enhanced(text: str, base_result: Optional[dict] = No
             for name, s in idi_scores.items()
             if s.raw_hits > 0
         },
+        'pack_spans': sorted(
+            [sp for s in idi_scores.values() for sp in s.spans],
+            key=lambda x: x['start'],
+        ),
     })
 
     return result
@@ -4534,7 +5500,7 @@ def analyze_prompt(text, task_id='', occupation='', attempter='', stage='',
     text_for_analysis = normalized_text
 
     # Run all analyzers
-    preamble_score, preamble_severity, preamble_hits = run_preamble(text_for_analysis)
+    preamble_score, preamble_severity, preamble_hits, preamble_spans = run_preamble(text_for_analysis)
     fingerprint_score, fingerprint_hits, fingerprint_rate = run_fingerprint(text_for_analysis)
     prompt_sig = run_prompt_signature_enhanced(text_for_analysis)
     voice_dis = run_voice_dissonance_enhanced(text_for_analysis)
@@ -4568,6 +5534,9 @@ def analyze_prompt(text, task_id='', occupation='', attempter='', stage='',
 
     # Windowed scoring
     window_result = score_windows(text_for_analysis)
+
+    # Span-level explainability (diagnostic)
+    _base_spans = collect_spans(text_for_analysis)
 
     # Evidence fusion
     det, reason, confidence, channel_details = determine(
@@ -4824,7 +5793,347 @@ def analyze_prompt(text, task_id='', occupation='', attempter='', stage='',
             'continuation_ncd_matrix_mean': 0.0, 'continuation_ncd_matrix_variance': 0.0,
         })
 
+    # Span-level explainability — merge all span sources
+    all_spans = list(_base_spans)
+    all_spans.extend(preamble_spans)
+    all_spans.extend(prompt_sig.get('pack_spans', []))
+    all_spans.extend(voice_dis.get('pack_spans', []))
+    all_spans.extend(instr_density.get('pack_spans', []))
+    # Hot window sentence ranges
+    for w in window_result.get('windows', []):
+        if w['score'] >= 0.30:
+            all_spans.append({
+                'start_sentence': w['start'],
+                'end_sentence': w['end'],
+                'score': w['score'],
+                'type': 'hot_window',
+            })
+    all_spans.sort(key=lambda s: s.get('start', s.get('start_sentence', 0)))
+    result['_spans'] = all_spans
+    result['detection_spans'] = all_spans
+
     return result
+
+
+# ==============================================================================
+# REPORTING: ATTEMPTER PROFILING
+# ==============================================================================
+
+
+def profile_attempters(results, min_submissions=2):
+    """Aggregate detection results by attempter.
+
+    Returns list of attempter profiles sorted by flag rate (descending).
+    """
+    by_attempter = {}
+    for r in results:
+        att = r.get('attempter', '').strip()
+        if att:
+            by_attempter.setdefault(att, []).append(r)
+
+    profiles = []
+    for att, submissions in by_attempter.items():
+        if len(submissions) < min_submissions:
+            continue
+
+        det_counts = {}
+        for r in submissions:
+            d = r.get('determination', 'GREEN')
+            det_counts[d] = det_counts.get(d, 0) + 1
+
+        n_total = len(submissions)
+        n_flagged = det_counts.get('RED', 0) + det_counts.get('AMBER', 0) + det_counts.get('MIXED', 0)
+        flag_rate = n_flagged / n_total
+
+        # Primary detection channel for flagged submissions
+        flagged_channels = {}
+        for r in submissions:
+            if r.get('determination') in ('RED', 'AMBER', 'MIXED'):
+                cd = r.get('channel_details', {}).get('channels', {})
+                for ch_name, ch_info in cd.items():
+                    if ch_info.get('severity') in ('RED', 'AMBER'):
+                        flagged_channels[ch_name] = flagged_channels.get(ch_name, 0) + 1
+
+        primary_channel = max(flagged_channels, key=flagged_channels.get) if flagged_channels else None
+
+        flagged_confs = [r['confidence'] for r in submissions
+                         if r.get('determination') in ('RED', 'AMBER', 'MIXED')]
+        mean_conf = sum(flagged_confs) / len(flagged_confs) if flagged_confs else 0.0
+
+        profiles.append({
+            'attempter': att,
+            'total_submissions': n_total,
+            'flagged': n_flagged,
+            'flag_rate': round(flag_rate, 3),
+            'red': det_counts.get('RED', 0),
+            'amber': det_counts.get('AMBER', 0),
+            'yellow': det_counts.get('YELLOW', 0),
+            'green': det_counts.get('GREEN', 0),
+            'mixed': det_counts.get('MIXED', 0),
+            'mean_flagged_confidence': round(mean_conf, 3),
+            'primary_detection_channel': primary_channel,
+            'occupations': list(set(r.get('occupation', '') for r in submissions if r.get('occupation'))),
+        })
+
+    profiles.sort(key=lambda p: (-p['flag_rate'], -p['flagged']))
+    return profiles
+
+
+def print_attempter_report(profiles):
+    """Print attempter profiling summary to stdout."""
+    if not profiles:
+        print("\n  No attempter data available for profiling.")
+        return
+
+    flagged_profiles = [p for p in profiles if p['flagged'] > 0]
+    total_submissions = sum(p['total_submissions'] for p in profiles)
+    total_flagged = sum(p['flagged'] for p in profiles)
+
+    print(f"\n{'='*90}")
+    print(f"  ATTEMPTER PROFILING: {len(profiles)} contributors, "
+          f"{total_submissions} submissions")
+    print(f"{'='*90}")
+
+    if flagged_profiles and total_flagged > 0:
+        top_n = max(1, int(len(profiles) * 0.10))
+        top_flagged = sum(p['flagged'] for p in flagged_profiles[:top_n])
+        concentration = top_flagged / total_flagged * 100
+        print(f"\n  Concentration: Top {top_n} contributor(s) account for "
+              f"{concentration:.0f}% of all flagged submissions")
+
+        print(f"\n  {'Attempter':<25} {'Subs':>5} {'Flag':>5} {'Rate':>7} "
+              f"{'R':>3} {'A':>3} {'Y':>3} {'G':>3} {'Primary Channel':<20}")
+        print(f"  {'-'*85}")
+
+        for p in flagged_profiles:
+            ch = p['primary_detection_channel'] or '-'
+            print(f"  {p['attempter'][:24]:<25} {p['total_submissions']:>5} "
+                  f"{p['flagged']:>5} {p['flag_rate']:>6.0%} "
+                  f"{p['red']:>3} {p['amber']:>3} {p['yellow']:>3} {p['green']:>3} "
+                  f"{ch:<20}")
+
+    clean = [p for p in profiles if p['flagged'] == 0]
+    if clean:
+        print(f"\n  Clean contributors ({len(clean)}): "
+              f"{', '.join(p['attempter'][:20] for p in clean[:10])}"
+              f"{'...' if len(clean) > 10 else ''}")
+
+
+# ==============================================================================
+# REPORTING: FINANCIAL IMPACT
+# ==============================================================================
+
+
+def financial_impact(results, cost_per_prompt=400.0):
+    """Calculate financial impact of detection.
+
+    Returns dict with impact metrics.
+    """
+    n_total = len(results)
+    det_counts = {}
+    for r in results:
+        d = r.get('determination', 'GREEN')
+        det_counts[d] = det_counts.get(d, 0) + 1
+
+    n_flagged = det_counts.get('RED', 0) + det_counts.get('AMBER', 0) + det_counts.get('MIXED', 0)
+    flag_rate = n_flagged / max(n_total, 1)
+    total_spend = n_total * cost_per_prompt
+    waste_at_flag = n_flagged * cost_per_prompt
+    clean_count = n_total - n_flagged
+    clean_yield = clean_count / max(n_total, 1)
+    annual_waste = waste_at_flag * 4
+    annual_savings = annual_waste * 0.60
+
+    return {
+        'total_submissions': n_total,
+        'total_spend': total_spend,
+        'flagged_count': n_flagged,
+        'flag_rate': round(flag_rate, 3),
+        'waste_estimate': waste_at_flag,
+        'clean_yield': round(clean_yield, 3),
+        'clean_count': clean_count,
+        'projected_annual_waste': annual_waste,
+        'projected_annual_savings_60pct': annual_savings,
+    }
+
+
+def print_financial_report(impact, cost_per_prompt=400.0):
+    """Print financial impact summary to stdout."""
+    print(f"\n{'='*90}")
+    print(f"  FINANCIAL IMPACT ESTIMATE (${cost_per_prompt:.0f}/prompt)")
+    print(f"{'='*90}")
+    print(f"    Total submissions:       {impact['total_submissions']:>8}")
+    print(f"    Total spend:             ${impact['total_spend']:>10,.0f}")
+    print(f"    Flagged (RED+AMBER):     {impact['flagged_count']:>8}  "
+          f"({impact['flag_rate']:.1%})")
+    print(f"    Estimated waste:         ${impact['waste_estimate']:>10,.0f}")
+    print(f"    Clean yield:             {impact['clean_count']:>8}  "
+          f"({impact['clean_yield']:.1%})")
+    print(f"")
+    print(f"    Projected annual waste:  ${impact['projected_annual_waste']:>10,.0f}  "
+          f"(4 quarterly batches)")
+    print(f"    Annual savings (60%):    ${impact['projected_annual_savings_60pct']:>10,.0f}  "
+          f"(conservative catch rate)")
+
+
+# ==============================================================================
+# REPORTING: HTML REPORT GENERATOR
+# ==============================================================================
+
+_HTML_CSS = """
+body { font-family: 'Segoe UI', system-ui, sans-serif; max-width: 900px;
+       margin: 40px auto; padding: 0 20px; background: #fafafa; color: #1a1a1a; }
+.header { border-bottom: 3px solid #1a1a1a; padding-bottom: 16px; margin-bottom: 24px; }
+.det { font-size: 28px; font-weight: 700; }
+.det-RED { color: #d32f2f; } .det-AMBER { color: #f57c00; }
+.det-YELLOW { color: #fbc02d; } .det-GREEN { color: #388e3c; }
+.det-MIXED { color: #1976d2; }
+.meta { color: #666; font-size: 14px; margin-top: 8px; }
+.text-container { background: white; border: 1px solid #e0e0e0; border-radius: 8px;
+                  padding: 24px; line-height: 1.8; font-size: 15px; white-space: pre-wrap;
+                  word-wrap: break-word; }
+.signal { padding: 2px 0; border-bottom: 3px solid; cursor: help; }
+.signal-CRITICAL { border-color: #ff1744; background: #ffebee; }
+.signal-HIGH { border-color: #ff5722; background: #fbe9e7; }
+.signal-MEDIUM { border-color: #ff9800; background: #fff3e0; }
+.signal-LOW { border-color: #42a5f5; background: #e3f2fd; }
+.signal-hot_window { border-color: #ef5350; background: #ffcdd2; }
+.legend { margin-top: 24px; padding: 16px; background: #f5f5f5; border-radius: 8px;
+          font-size: 13px; }
+.legend span { display: inline-block; margin-right: 16px; }
+.channels { margin-top: 24px; }
+.ch-row { display: flex; align-items: center; padding: 8px 0;
+          border-bottom: 1px solid #eee; font-size: 14px; }
+.ch-name { width: 160px; font-weight: 600; }
+.ch-sev { width: 80px; font-weight: 600; }
+"""
+
+
+def _apply_highlights(text, spans):
+    """Apply highlight markup to text at span positions.
+
+    Handles overlapping spans by using the highest-severity span at each position.
+    """
+    import html as _html
+    if not spans:
+        return _html.escape(text)
+
+    severity_rank = {'CRITICAL': 4, 'HIGH': 3, 'MEDIUM': 2, 'LOW': 1}
+    char_map = [None] * len(text)
+    for span in spans:
+        start = span.get('start', -1)
+        end = span.get('end', start)
+        if start < 0:
+            continue
+        sev = span.get('severity', span.get('type', 'LOW'))
+        tooltip = span.get('pack', span.get('pattern', ''))
+        rank = severity_rank.get(sev, 0)
+        for i in range(max(0, start), min(end, len(text))):
+            if char_map[i] is None or rank > char_map[i][2]:
+                char_map[i] = (sev, tooltip, rank)
+
+    out = []
+    i = 0
+    while i < len(text):
+        if char_map[i] is None:
+            j = i
+            while j < len(text) and char_map[j] is None:
+                j += 1
+            out.append(_html.escape(text[i:j]))
+            i = j
+        else:
+            sev, tooltip, rank = char_map[i]
+            j = i
+            while j < len(text) and char_map[j] is not None and char_map[j][:2] == (sev, tooltip):
+                j += 1
+            css_class = f"signal-{sev}"
+            out.append(
+                f'<span class="signal {css_class}" title="{_html.escape(tooltip)}">'
+                f'{_html.escape(text[i:j])}</span>'
+            )
+            i = j
+
+    return ''.join(out)
+
+
+def generate_html_report(text, result, output_path=None):
+    """Generate an HTML report with highlighted detection spans.
+
+    Args:
+        text: Original input text.
+        result: Pipeline result dict (must include 'detection_spans' or '_spans').
+        output_path: Where to write the HTML file. If None, returns HTML string.
+    """
+    import html as _html
+
+    spans = result.get('detection_spans', result.get('_spans', []))
+    det = result.get('determination', 'GREEN')
+    reason = result.get('reason', '')
+    confidence = result.get('confidence', 0)
+    task_id = result.get('task_id', '')
+    word_count = result.get('word_count', 0)
+
+    char_spans = sorted(
+        [s for s in spans if 'start' in s and 'end' in s],
+        key=lambda s: s['start'],
+    )
+
+    highlighted = _apply_highlights(text, char_spans)
+
+    cd = result.get('channel_details', {}).get('channels', {})
+    channel_rows = []
+    for ch_name in ['prompt_structure', 'stylometry', 'continuation', 'windowing']:
+        info = cd.get(ch_name, {})
+        sev = info.get('severity', 'GREEN')
+        expl = info.get('explanation', '')[:80]
+        channel_rows.append(
+            f'<div class="ch-row">'
+            f'<div class="ch-name">{ch_name}</div>'
+            f'<div class="ch-sev det-{sev}">{sev}</div>'
+            f'<div style="flex:1">{_html.escape(expl)}</div>'
+            f'</div>'
+        )
+
+    n_char_spans = len(char_spans)
+    n_hot = sum(1 for s in spans if s.get('type') == 'hot_window')
+    span_summary = f"{n_char_spans} character spans"
+    if n_hot:
+        span_summary += f", {n_hot} hot windows"
+
+    report = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>BEET Detection Report — {_html.escape(task_id)}</title>
+<style>{_HTML_CSS}</style></head><body>
+<div class="header">
+    <div class="det det-{det}">{det}</div>
+    <div class="meta">
+        Task: {_html.escape(task_id)} | Words: {word_count} |
+        Confidence: {confidence:.1%} |
+        Mode: {result.get('mode', '?')} |
+        Spans: {span_summary}
+    </div>
+    <div class="meta" style="margin-top:4px">{_html.escape(reason[:200])}</div>
+</div>
+<div class="text-container">{highlighted}</div>
+<div class="legend">
+    <strong>Legend:</strong>
+    <span class="signal signal-CRITICAL">CRITICAL</span>
+    <span class="signal signal-HIGH">HIGH</span>
+    <span class="signal signal-MEDIUM">MEDIUM</span>
+    <span class="signal signal-LOW">LOW (fingerprint/lexicon)</span>
+</div>
+<div class="channels">
+    <h3>Channel Scores</h3>
+    {''.join(channel_rows)}
+</div>
+</body></html>"""
+
+    if output_path:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(report)
+        return output_path
+
+    return report
 
 
 # ==============================================================================
@@ -4918,6 +6227,12 @@ def main():
                         help='Skip cross-submission similarity analysis')
     parser.add_argument('--similarity-threshold', type=float, default=0.40,
                         help='Jaccard threshold for text similarity (default: 0.40)')
+    parser.add_argument('--semantic-similarity', action='store_true',
+                        help='Enable semantic embedding similarity (requires sentence-transformers)')
+    parser.add_argument('--similarity-store', metavar='PATH',
+                        help='JSONL path for cross-batch MinHash similarity store')
+    parser.add_argument('--instructions', metavar='PATH',
+                        help='Text file with shared instructions to factor out of similarity')
     parser.add_argument('--collect', metavar='PATH',
                         help='Append scored results to JSONL file for baseline accumulation')
     parser.add_argument('--analyze-baselines', metavar='JSONL',
@@ -4942,6 +6257,20 @@ def main():
                         help='Build calibration table from labeled baseline JSONL and save to --cal-table')
     parser.add_argument('--cal-table', metavar='JSON',
                         help='Path to calibration table JSON (load for scoring, or save target for --calibrate)')
+    parser.add_argument('--cost-per-prompt', type=float, default=400.0,
+                        help='Cost per prompt for financial impact estimate (default: $400)')
+    parser.add_argument('--html-report', metavar='DIR',
+                        help='Generate HTML reports for flagged submissions in DIR')
+    parser.add_argument('--memory', metavar='DIR', default=None,
+                        help='Path to BEET memory store directory (enables cross-batch memory)')
+    parser.add_argument('--confirm', nargs=3, metavar=('TASK_ID', 'LABEL', 'REVIEWER'),
+                        help='Record ground truth confirmation: --confirm task_001 ai reviewer_A')
+    parser.add_argument('--attempter-history', metavar='NAME',
+                        help='Show historical profile for an attempter from memory store')
+    parser.add_argument('--memory-summary', action='store_true',
+                        help='Print memory store summary and exit')
+    parser.add_argument('--rebuild-calibration', action='store_true',
+                        help='Rebuild calibration from confirmed labels in memory store')
     args = parser.parse_args()
 
     if args.gui:
@@ -4951,6 +6280,30 @@ def main():
     if not args.api_key:
         env_key = 'ANTHROPIC_API_KEY' if args.provider == 'anthropic' else 'OPENAI_API_KEY'
         args.api_key = os.environ.get(env_key)
+
+    # Memory store initialization
+    store = None
+    if getattr(args, 'memory', None):
+        store = MemoryStore(args.memory)
+
+    # Standalone memory commands
+    if getattr(args, 'memory_summary', False) and store:
+        store.print_summary()
+        return
+
+    if getattr(args, 'confirm', None) and store:
+        task_id, label, reviewer = args.confirm
+        store.record_confirmation(task_id, label, verified_by=reviewer)
+        return
+
+    if getattr(args, 'attempter_history', None) and store:
+        history = store.get_attempter_history(args.attempter_history)
+        _print_attempter_history(history)
+        return
+
+    if getattr(args, 'rebuild_calibration', False) and store:
+        cal = store.rebuild_calibration()
+        return
 
     if args.analyze_baselines:
         if not os.path.exists(args.analyze_baselines):
@@ -5068,16 +6421,48 @@ def main():
         for r in sorted(yellow, key=lambda x: x['confidence'], reverse=True)[:10]:
             print(f"    \U0001f7e1 {r['task_id'][:12]:12} {r['occupation'][:40]:40} | {r['reason'][:50]}")
 
+    # Instruction template factoring (FEAT 15)
+    instruction_shingles = None
+    if getattr(args, 'instructions', None):
+        with open(args.instructions, 'r') as _f:
+            instruction_shingles = _word_shingles(_f.read())
+
     if not args.no_similarity and len(results) >= 2:
         sim_pairs = analyze_similarity(
             results, text_map,
             jaccard_threshold=args.similarity_threshold,
+            semantic=getattr(args, 'semantic_similarity', False),
+            instruction_shingles=instruction_shingles,
+            similarity_store_path=getattr(args, 'similarity_store', None),
         )
+        n_upgrades = apply_similarity_feedback(results, sim_pairs)
         print_similarity_report(sim_pairs)
+        if n_upgrades:
+            print(f"\n  {n_upgrades} determination(s) upgraded via similarity feedback")
     else:
         sim_pairs = []
 
-    default_name = os.path.basename(args.input).rsplit('.', 1)[0] + '_pipeline_v061.csv'
+    # Attempter profiling
+    if len(results) >= 5:
+        profiles = profile_attempters(results)
+        print_attempter_report(profiles)
+
+    # Financial impact
+    if len(results) >= 10:
+        impact = financial_impact(results, cost_per_prompt=args.cost_per_prompt)
+        print_financial_report(impact, cost_per_prompt=args.cost_per_prompt)
+
+    # HTML reports for flagged submissions
+    if getattr(args, 'html_report', None) and flagged:
+        os.makedirs(args.html_report, exist_ok=True)
+        for r in flagged:
+            tid = r.get('task_id', 'unknown')[:20]
+            path = os.path.join(args.html_report, f"{tid}_{r['determination']}.html")
+            generate_html_report(
+                text_map.get(r.get('task_id', ''), ''), r, path)
+        print(f"\n  HTML reports written to {args.html_report}/ ({len(flagged)} files)")
+
+    default_name = os.path.basename(args.input).rsplit('.', 1)[0] + '_pipeline_v065.csv'
     input_dir = os.path.dirname(os.path.abspath(args.input))
     output_path = args.output or os.path.join(input_dir, default_name)
 
@@ -5101,6 +6486,16 @@ def main():
 
     if args.collect:
         collect_baselines(results, args.collect)
+
+    # Memory store: cross-batch similarity + batch recording
+    if store:
+        cross_flags = store.cross_batch_similarity(results, text_map)
+        if cross_flags:
+            print(f"\n  CROSS-BATCH MEMORY: {len(cross_flags)} matches to previous submissions")
+            for cf in cross_flags[:5]:
+                print(f"    {cf['current_id'][:15]} <-> {cf['historical_id'][:15]} "
+                      f"(MH={cf['minhash_similarity']:.2f})")
+        store.record_batch(results, text_map)
 
 
 def main_gui():
