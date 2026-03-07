@@ -18,6 +18,7 @@ import sys
 import json
 import math
 import zlib
+import hashlib
 import statistics
 import unicodedata
 import threading
@@ -706,6 +707,8 @@ _BASELINE_FIELDS = [
     'window_fw_trajectory_cv', 'window_comp_trajectory_mean', 'window_comp_trajectory_cv',
     'tocsin_cohesiveness', 'tocsin_determination', 'tocsin_confidence',
     'surprisal_trajectory_cv', 'surprisal_stationarity',
+    # v0.65 addendum: similarity feedback
+    'similarity_upgraded',
 ]
 
 
@@ -904,22 +907,131 @@ def _structural_similarity(r1, r2):
     return 1.0 / (1.0 + math.sqrt(diff_sq))
 
 
-def analyze_similarity(results, text_map, jaccard_threshold=0.40, struct_threshold=0.90):
-    """Analyze cross-submission similarity within occupation groups."""
+def _adaptive_thresholds(group, shingle_cache, jaccard_threshold, struct_threshold):
+    """Compute adaptive similarity thresholds from occupation group distribution.
+
+    Uses median + 2*std of all pairwise scores within the group. Falls back
+    to flat thresholds when fewer than 4 results are available.
+    """
+    if len(group) < 4:
+        return jaccard_threshold, struct_threshold
+
+    jac_vals = []
+    struct_vals = []
+    for i in range(len(group)):
+        for j in range(i + 1, len(group)):
+            tid_a = group[i].get('task_id', '')
+            tid_b = group[j].get('task_id', '')
+            jac_vals.append(_jaccard(
+                shingle_cache.get(tid_a, set()),
+                shingle_cache.get(tid_b, set()),
+            ))
+            struct_vals.append(_structural_similarity(group[i], group[j]))
+
+    if len(jac_vals) < 3:
+        return jaccard_threshold, struct_threshold
+
+    med_jac = statistics.median(jac_vals)
+    std_jac = statistics.stdev(jac_vals) if len(jac_vals) >= 2 else 0.0
+    med_struct = statistics.median(struct_vals)
+    std_struct = statistics.stdev(struct_vals) if len(struct_vals) >= 2 else 0.0
+
+    adj_jac = max(med_jac + 2 * std_jac, 0.15)
+    adj_struct = max(med_struct + 2 * std_struct, 0.50)
+
+    # Never exceed user-specified thresholds
+    adj_jac = min(adj_jac, jaccard_threshold)
+    adj_struct = min(adj_struct, struct_threshold)
+
+    return adj_jac, adj_struct
+
+
+def _minhash_signature(shingles, n_hashes=128):
+    """Compute MinHash signature for a set of shingles (pure Python, zero deps)."""
+    sig = [float('inf')] * n_hashes
+    for shingle in shingles:
+        s = ' '.join(shingle) if isinstance(shingle, tuple) else str(shingle)
+        for i in range(n_hashes):
+            h = int(hashlib.md5(f"{i}:{s}".encode()).hexdigest(), 16)
+            sig[i] = min(sig[i], h)
+    return sig
+
+
+def _minhash_jaccard(sig_a, sig_b):
+    """Estimate Jaccard similarity from two MinHash signatures."""
+    if not sig_a or not sig_b or len(sig_a) != len(sig_b):
+        return 0.0
+    return sum(a == b for a, b in zip(sig_a, sig_b)) / len(sig_a)
+
+
+def _load_minhash_store(path):
+    """Load MinHash fingerprint store from JSONL file."""
+    entries = []
+    if not os.path.exists(path):
+        return entries
+    with open(path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                entries.append(json.loads(line))
+    return entries
+
+
+def _store_minhash(entries, path):
+    """Append MinHash fingerprint entries to JSONL file."""
+    with open(path, 'a') as f:
+        for entry in entries:
+            f.write(json.dumps(entry) + '\n')
+
+
+def _factor_instructions(shingles, instruction_shingles):
+    """Remove instruction-derived shingles from a submission's shingle set."""
+    if not instruction_shingles:
+        return shingles
+    return shingles - instruction_shingles
+
+
+def analyze_similarity(results, text_map, jaccard_threshold=0.40, struct_threshold=0.90,
+                       semantic=False, instruction_shingles=None, similarity_store_path=None):
+    """Analyze cross-submission similarity within occupation groups.
+
+    Supports adaptive thresholds (FEAT 11), semantic embeddings (FEAT 12),
+    cross-batch MinHash store (FEAT 14), and instruction factoring (FEAT 15).
+    """
     by_occ = defaultdict(list)
     for r in results:
         occ = r.get('occupation', '(unknown)')
         by_occ[occ].append(r)
 
+    # Build shingle cache with optional instruction factoring (FEAT 15)
     shingle_cache = {}
     for tid, text in text_map.items():
-        shingle_cache[tid] = _word_shingles(text)
+        s = _word_shingles(text)
+        if instruction_shingles:
+            s = _factor_instructions(s, instruction_shingles)
+        shingle_cache[tid] = s
+
+    # Build embedding cache for semantic similarity (FEAT 12)
+    embedding_cache = {}
+    if semantic and HAS_SEMANTIC:
+        _ensure_semantic()
+        all_tids = [r.get('task_id', '') for r in results
+                    if r.get('task_id', '') in text_map]
+        all_texts = [text_map[tid] for tid in all_tids]
+        if all_texts:
+            all_vecs = _EMBEDDER.encode(all_texts)
+            for tid, vec in zip(all_tids, all_vecs):
+                embedding_cache[tid] = vec
 
     flagged_pairs = []
 
     for occ, group in by_occ.items():
         if len(group) < 2:
             continue
+
+        # FEAT 11: adaptive thresholds per occupation group
+        jac_thresh, str_thresh = _adaptive_thresholds(
+            group, shingle_cache, jaccard_threshold, struct_threshold)
 
         for i in range(len(group)):
             for j in range(i + 1, len(group)):
@@ -939,11 +1051,19 @@ def analyze_similarity(results, text_map, jaccard_threshold=0.40, struct_thresho
                 )
                 struct = _structural_similarity(r_a, r_b)
 
+                # FEAT 12: semantic embedding similarity
+                sem = 0.0
+                if semantic and tid_a in embedding_cache and tid_b in embedding_cache:
+                    sem = float(_cosine_similarity(
+                        [embedding_cache[tid_a]], [embedding_cache[tid_b]])[0][0])
+
                 flags = []
-                if jac >= jaccard_threshold:
+                if jac >= jac_thresh:
                     flags.append('text')
-                if struct >= struct_threshold:
+                if struct >= str_thresh:
                     flags.append('structural')
+                if sem >= 0.85:
+                    flags.append('semantic')
 
                 if flags:
                     flagged_pairs.append({
@@ -954,13 +1074,125 @@ def analyze_similarity(results, text_map, jaccard_threshold=0.40, struct_thresho
                         'occupation': occ,
                         'jaccard': jac,
                         'structural': struct,
+                        'semantic': sem,
                         'flag_type': '+'.join(flags),
                         'det_a': r_a['determination'],
                         'det_b': r_b['determination'],
+                        'adaptive_jac_threshold': jac_thresh,
+                        'adaptive_struct_threshold': str_thresh,
                     })
+
+    # FEAT 14: cross-batch MinHash store
+    if similarity_store_path:
+        stored = _load_minhash_store(similarity_store_path)
+
+        # Compare current batch against stored fingerprints
+        for r in results:
+            tid = r.get('task_id', '')
+            occ = r.get('occupation', '(unknown)')
+            att = r.get('attempter', '').strip().lower()
+            shingles = shingle_cache.get(tid, set())
+            if not shingles:
+                continue
+            sig = _minhash_signature(shingles)
+            for entry in stored:
+                if entry.get('occupation', '') != occ:
+                    continue
+                stored_att = entry.get('attempter', '').strip().lower()
+                if stored_att and att and stored_att == att:
+                    continue
+                est_jac = _minhash_jaccard(sig, entry.get('minhash', []))
+                if est_jac >= max(jaccard_threshold * 0.8, 0.12):
+                    flagged_pairs.append({
+                        'id_a': tid,
+                        'id_b': entry.get('task_id', ''),
+                        'attempter_a': r.get('attempter', ''),
+                        'attempter_b': entry.get('attempter', ''),
+                        'occupation': occ,
+                        'jaccard': est_jac,
+                        'structural': 0.0,
+                        'semantic': 0.0,
+                        'flag_type': 'cross-batch',
+                        'det_a': r.get('determination', ''),
+                        'det_b': entry.get('determination', ''),
+                        'adaptive_jac_threshold': jaccard_threshold,
+                        'adaptive_struct_threshold': struct_threshold,
+                    })
+
+        # Store current batch fingerprints
+        from datetime import datetime as _dt
+        new_entries = []
+        for r in results:
+            tid = r.get('task_id', '')
+            shingles = shingle_cache.get(tid, set())
+            if not shingles:
+                continue
+            new_entries.append({
+                'task_id': tid,
+                'attempter': r.get('attempter', ''),
+                'occupation': r.get('occupation', '(unknown)'),
+                'determination': r.get('determination', ''),
+                'minhash': _minhash_signature(shingles),
+                'timestamp': _dt.now().isoformat(),
+            })
+        if new_entries:
+            _store_minhash(new_entries, similarity_store_path)
 
     flagged_pairs.sort(key=lambda p: p['jaccard'], reverse=True)
     return flagged_pairs
+
+
+def apply_similarity_feedback(results, sim_pairs):
+    """Post-hoc upgrade YELLOW -> AMBER when similarity confirms template reuse (FEAT 13).
+
+    Returns count of upgraded determinations.
+    """
+    result_map = {}
+    for r in results:
+        tid = r.get('task_id', '')
+        if tid:
+            result_map[tid] = r
+
+    n_upgrades = 0
+    for pair in sim_pairs:
+        # Only act on meaningful similarity signals
+        flag_type = pair.get('flag_type', '')
+        has_semantic = 'semantic' in flag_type
+        has_text = 'text' in flag_type
+        if not has_semantic and not has_text:
+            continue
+
+        r_a = result_map.get(pair['id_a'])
+        r_b = result_map.get(pair['id_b'])
+        if not r_a or not r_b:
+            continue
+
+        det_a = r_a.get('determination', '')
+        det_b = r_b.get('determination', '')
+
+        # Case 1: one YELLOW paired with RED/AMBER → upgrade YELLOW to AMBER
+        if det_a == 'YELLOW' and det_b in ('RED', 'AMBER'):
+            r_a['determination'] = 'AMBER'
+            r_a['reason'] = r_a.get('reason', '') + f" [upgraded: similarity with {pair['id_b']}]"
+            r_a['similarity_upgraded'] = True
+            n_upgrades += 1
+        if det_b == 'YELLOW' and det_a in ('RED', 'AMBER'):
+            r_b['determination'] = 'AMBER'
+            r_b['reason'] = r_b.get('reason', '') + f" [upgraded: similarity with {pair['id_a']}]"
+            r_b['similarity_upgraded'] = True
+            n_upgrades += 1
+
+        # Case 2: both YELLOW and high semantic → upgrade both to AMBER
+        if det_a == 'YELLOW' and det_b == 'YELLOW' and pair.get('semantic', 0) >= 0.90:
+            r_a['determination'] = 'AMBER'
+            r_a['reason'] = r_a.get('reason', '') + f" [upgraded: mutual similarity with {pair['id_b']}]"
+            r_a['similarity_upgraded'] = True
+            r_b['determination'] = 'AMBER'
+            r_b['reason'] = r_b.get('reason', '') + f" [upgraded: mutual similarity with {pair['id_a']}]"
+            r_b['similarity_upgraded'] = True
+            n_upgrades += 2
+
+    return n_upgrades
 
 
 def print_similarity_report(pairs):
@@ -975,7 +1207,9 @@ def print_similarity_report(pairs):
 
     for p in pairs:
         icon = 'RED' if p['jaccard'] >= 0.70 else 'AMBER' if p['jaccard'] >= 0.50 else 'YELLOW'
-        print(f"\n  [{icon}] Jaccard={p['jaccard']:.2f}  Struct={p['structural']:.2f}  [{p['flag_type']}]")
+        prefix = '[CROSS-BATCH] ' if p.get('flag_type') == 'cross-batch' else ''
+        sem_str = f"  Sem={p['semantic']:.2f}" if p.get('semantic', 0) > 0 else ''
+        print(f"\n  {prefix}[{icon}] Jaccard={p['jaccard']:.2f}  Struct={p['structural']:.2f}{sem_str}  [{p['flag_type']}]")
         print(f"     {p['id_a'][:15]:15s} ({p['attempter_a'] or '?':20s}) [{p['det_a']}]")
         print(f"     {p['id_b'][:15]:15s} ({p['attempter_b'] or '?':20s}) [{p['det_b']}]")
         print(f"     Occupation: {p['occupation'][:50]}")
@@ -5405,6 +5639,12 @@ def main():
                         help='Skip cross-submission similarity analysis')
     parser.add_argument('--similarity-threshold', type=float, default=0.40,
                         help='Jaccard threshold for text similarity (default: 0.40)')
+    parser.add_argument('--semantic-similarity', action='store_true',
+                        help='Enable semantic embedding similarity (requires sentence-transformers)')
+    parser.add_argument('--similarity-store', metavar='PATH',
+                        help='JSONL path for cross-batch MinHash similarity store')
+    parser.add_argument('--instructions', metavar='PATH',
+                        help='Text file with shared instructions to factor out of similarity')
     parser.add_argument('--collect', metavar='PATH',
                         help='Append scored results to JSONL file for baseline accumulation')
     parser.add_argument('--analyze-baselines', metavar='JSONL',
@@ -5559,12 +5799,24 @@ def main():
         for r in sorted(yellow, key=lambda x: x['confidence'], reverse=True)[:10]:
             print(f"    \U0001f7e1 {r['task_id'][:12]:12} {r['occupation'][:40]:40} | {r['reason'][:50]}")
 
+    # Instruction template factoring (FEAT 15)
+    instruction_shingles = None
+    if getattr(args, 'instructions', None):
+        with open(args.instructions, 'r') as _f:
+            instruction_shingles = _word_shingles(_f.read())
+
     if not args.no_similarity and len(results) >= 2:
         sim_pairs = analyze_similarity(
             results, text_map,
             jaccard_threshold=args.similarity_threshold,
+            semantic=getattr(args, 'semantic_similarity', False),
+            instruction_shingles=instruction_shingles,
+            similarity_store_path=getattr(args, 'similarity_store', None),
         )
+        n_upgrades = apply_similarity_feedback(results, sim_pairs)
         print_similarity_report(sim_pairs)
+        if n_upgrades:
+            print(f"\n  {n_upgrades} determination(s) upgraded via similarity feedback")
     else:
         sim_pairs = []
 
