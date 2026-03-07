@@ -1215,6 +1215,594 @@ def print_similarity_report(pairs):
         print(f"     Occupation: {p['occupation'][:50]}")
 
 # ==============================================================================
+# HISTORICAL MEMORY STORE
+# Unified persistence layer for cross-batch detection memory.
+# All data lives in a single directory (default .beet/).
+# ==============================================================================
+
+from pathlib import Path as _Path
+import shutil as _shutil
+
+
+class MemoryStore:
+    """Persistent memory for the BEET detection pipeline.
+
+    Usage:
+        store = MemoryStore('.beet/')
+        store.record_batch(results, text_map, batch_id='batch_001')
+        history = store.get_attempter_history('worker_42')
+        cross_matches = store.cross_batch_similarity(results, text_map)
+        store.record_confirmation('task_001', 'ai', verified_by='reviewer_A')
+    """
+
+    def __init__(self, store_dir='.beet'):
+        self.store_dir = _Path(store_dir)
+        self.store_dir.mkdir(parents=True, exist_ok=True)
+        (self.store_dir / 'calibration_history').mkdir(exist_ok=True)
+
+        self.submissions_path = self.store_dir / 'submissions.jsonl'
+        self.fingerprints_path = self.store_dir / 'fingerprints.jsonl'
+        self.attempters_path = self.store_dir / 'attempters.jsonl'
+        self.confirmed_path = self.store_dir / 'confirmed.jsonl'
+        self.calibration_path = self.store_dir / 'calibration.json'
+        self.config_path = self.store_dir / 'config.json'
+
+        self._config = self._load_config()
+
+    # ── Config ────────────────────────────────────────────────────
+
+    def _load_config(self):
+        if self.config_path.exists():
+            with open(self.config_path) as f:
+                return json.load(f)
+        return {
+            'version': '0.65',
+            'created': datetime.now().isoformat(),
+            'last_updated': datetime.now().isoformat(),
+            'total_submissions': 0,
+            'total_batches': 0,
+            'total_attempters': 0,
+            'total_confirmed': 0,
+            'occupations': [],
+        }
+
+    def _save_config(self):
+        self._config['last_updated'] = datetime.now().isoformat()
+        with open(self.config_path, 'w') as f:
+            json.dump(self._config, f, indent=2)
+
+    # ── Batch Recording ──────────────────────────────────────────
+
+    def record_batch(self, results, text_map, batch_id=None):
+        """Record a full batch of pipeline results to memory.
+
+        Updates submissions, fingerprints, attempter profiles, and config.
+        """
+        if batch_id is None:
+            batch_id = f"batch_{datetime.now().strftime('%Y-%m-%d_%H:%M')}"
+
+        timestamp = datetime.now().isoformat()
+        n_written = 0
+
+        # Write submissions
+        with open(self.submissions_path, 'a') as f:
+            for r in results:
+                record = {k: r.get(k) for k in _BASELINE_FIELDS}
+                record['batch_id'] = batch_id
+                record['timestamp'] = timestamp
+                record['pipeline_version'] = r.get('audit_trail', {}).get(
+                    'pipeline_version', 'unknown')
+                record['similarity_partners'] = r.get('similarity_partners', 0)
+                record['similarity_max_semantic'] = r.get('similarity_max_semantic', 0.0)
+                wc = r.get('word_count', 0)
+                if wc < 100:
+                    record['length_bin'] = 'short'
+                elif wc < 300:
+                    record['length_bin'] = 'medium'
+                elif wc < 800:
+                    record['length_bin'] = 'long'
+                else:
+                    record['length_bin'] = 'very_long'
+                f.write(json.dumps(record, default=str) + '\n')
+                n_written += 1
+
+        # Write fingerprints
+        self._write_fingerprints(results, text_map, batch_id)
+
+        # Update attempter profiles
+        self._update_attempter_profiles(results, batch_id, timestamp)
+
+        # Update config
+        self._config['total_submissions'] += n_written
+        self._config['total_batches'] += 1
+        occs = set(self._config.get('occupations', []))
+        for r in results:
+            occ = r.get('occupation', '')
+            if occ:
+                occs.add(occ)
+        self._config['occupations'] = sorted(occs)
+        self._save_config()
+
+        print(f"  Memory: {n_written} submissions recorded to {self.store_dir}/")
+        return n_written
+
+    def _write_fingerprints(self, results, text_map, batch_id):
+        """Write MinHash and optional embedding fingerprints."""
+        # Pre-compute embeddings if available
+        embeddings = {}
+        if HAS_SEMANTIC:
+            _ensure_semantic()
+            texts = []
+            tids = []
+            for r in results:
+                tid = r.get('task_id', '')
+                text = text_map.get(tid, '')
+                if text:
+                    texts.append(text)
+                    tids.append(tid)
+            if texts:
+                raw_embeds = _EMBEDDER.encode(texts)
+                for tid, emb in zip(tids, raw_embeds):
+                    embeddings[tid] = [round(float(v), 5) for v in emb[:64]]
+
+        with open(self.fingerprints_path, 'a') as f:
+            for r in results:
+                tid = r.get('task_id', '')
+                text = text_map.get(tid, '')
+                if not text:
+                    continue
+
+                shingles = _word_shingles(text)
+                minhash = _minhash_signature(shingles)
+
+                struct_vec = {feat: r.get(feat, 0) for feat in _STRUCT_FEATURES}
+
+                record = {
+                    'task_id': tid,
+                    'attempter': r.get('attempter', ''),
+                    'occupation': r.get('occupation', ''),
+                    'batch_id': batch_id,
+                    'determination': r.get('determination', ''),
+                    'minhash_128': minhash,
+                    'structural_vec': struct_vec,
+                }
+
+                if tid in embeddings:
+                    record['embedding_64'] = embeddings[tid]
+
+                f.write(json.dumps(record, default=str) + '\n')
+
+    # ── Attempter Profiles ───────────────────────────────────────
+
+    def _update_attempter_profiles(self, results, batch_id, timestamp):
+        """Update rolling attempter profiles with new batch results."""
+        profiles = self._load_attempter_profiles()
+
+        by_att = defaultdict(list)
+        for r in results:
+            att = r.get('attempter', '').strip()
+            if att:
+                by_att[att].append(r)
+
+        for att, submissions in by_att.items():
+            if att not in profiles:
+                profiles[att] = {
+                    'attempter': att,
+                    'total_submissions': 0,
+                    'determinations': {'RED': 0, 'AMBER': 0, 'YELLOW': 0,
+                                       'GREEN': 0, 'MIXED': 0, 'REVIEW': 0},
+                    'confirmed_ai': 0,
+                    'confirmed_human': 0,
+                    'occupations': [],
+                    'batches': [],
+                    'first_seen': timestamp,
+                    'feature_sums': {},
+                    'feature_counts': 0,
+                }
+
+            p = profiles[att]
+            p['total_submissions'] += len(submissions)
+            p['last_seen'] = timestamp
+            p['last_updated'] = timestamp
+
+            if batch_id not in p['batches']:
+                p['batches'].append(batch_id)
+
+            for r in submissions:
+                det = r.get('determination', 'GREEN')
+                p['determinations'][det] = p['determinations'].get(det, 0) + 1
+
+                occ = r.get('occupation', '')
+                if occ and occ not in p['occupations']:
+                    p['occupations'].append(occ)
+
+                for feat in ['prompt_signature_cfd', 'instruction_density_idi',
+                             'voice_dissonance_vsd', 'voice_dissonance_spec_score',
+                             'self_similarity_nssi_score']:
+                    val = r.get(feat, 0)
+                    if val:
+                        if feat not in p['feature_sums']:
+                            p['feature_sums'][feat] = 0.0
+                        p['feature_sums'][feat] += val
+
+                p['feature_counts'] += 1
+
+            # Compute derived fields
+            total = p['total_submissions']
+            flagged = (p['determinations'].get('RED', 0) +
+                       p['determinations'].get('AMBER', 0) +
+                       p['determinations'].get('MIXED', 0))
+            p['flag_rate'] = round(flagged / max(total, 1), 3)
+
+            if p['feature_counts'] > 0:
+                p['mean_features'] = {
+                    k: round(v / p['feature_counts'], 3)
+                    for k, v in p['feature_sums'].items()
+                }
+
+            # Risk tier
+            p['risk_tier'] = self._compute_risk_tier(p)
+
+            # Primary detection channel
+            channel_counts = Counter()
+            for r in submissions:
+                if r.get('determination') in ('RED', 'AMBER', 'MIXED'):
+                    cd = r.get('channel_details', {})
+                    if isinstance(cd, dict):
+                        channels = cd.get('channels', {})
+                        for ch, info in channels.items():
+                            if isinstance(info, dict) and info.get('severity') in ('RED', 'AMBER'):
+                                channel_counts[ch] += 1
+            if channel_counts:
+                p['primary_detection_channel'] = channel_counts.most_common(1)[0][0]
+
+        self._save_attempter_profiles(profiles)
+        self._config['total_attempters'] = len(profiles)
+
+    @staticmethod
+    def _compute_risk_tier(profile):
+        """Compute risk tier from flag rate and confirmation history."""
+        flag_rate = profile.get('flag_rate', 0)
+        confirmed_ai = profile.get('confirmed_ai', 0)
+        if confirmed_ai > 0 and flag_rate > 0.50:
+            return 'CRITICAL'
+        elif flag_rate > 0.30 or confirmed_ai > 0:
+            return 'HIGH'
+        elif flag_rate > 0.15:
+            return 'ELEVATED'
+        else:
+            return 'NORMAL'
+
+    def _load_attempter_profiles(self):
+        """Load attempter profiles dict."""
+        profiles = {}
+        if self.attempters_path.exists():
+            with open(self.attempters_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            p = json.loads(line)
+                            profiles[p['attempter']] = p
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+        return profiles
+
+    def _save_attempter_profiles(self, profiles):
+        """Save attempter profiles (full rewrite)."""
+        with open(self.attempters_path, 'w') as f:
+            for p in sorted(profiles.values(),
+                            key=lambda x: x.get('flag_rate', 0), reverse=True):
+                f.write(json.dumps(p, default=str) + '\n')
+
+    # ── Queries ──────────────────────────────────────────────────
+
+    def get_attempter_history(self, attempter):
+        """Get full history for a specific attempter."""
+        profiles = self._load_attempter_profiles()
+        profile = profiles.get(attempter.strip())
+
+        submissions = []
+        if self.submissions_path.exists():
+            with open(self.submissions_path) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line.strip())
+                        if rec.get('attempter', '').strip() == attempter.strip():
+                            submissions.append(rec)
+                    except json.JSONDecodeError:
+                        continue
+
+        confirmations = []
+        if self.confirmed_path.exists():
+            with open(self.confirmed_path) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line.strip())
+                        if rec.get('attempter', '').strip() == attempter.strip():
+                            confirmations.append(rec)
+                    except json.JSONDecodeError:
+                        continue
+
+        return {
+            'profile': profile,
+            'submissions': submissions,
+            'confirmations': confirmations,
+        }
+
+    def get_attempter_risk_report(self, min_submissions=2):
+        """Get all attempters ranked by risk tier and flag rate."""
+        profiles = self._load_attempter_profiles()
+        tier_rank = {'CRITICAL': 4, 'HIGH': 3, 'ELEVATED': 2, 'NORMAL': 1}
+        return sorted(
+            [p for p in profiles.values()
+             if p.get('total_submissions', 0) >= min_submissions],
+            key=lambda p: (-tier_rank.get(p.get('risk_tier', 'NORMAL'), 0),
+                           -p.get('flag_rate', 0)),
+        )
+
+    def get_occupation_baselines(self, occupation):
+        """Get historical feature distributions for an occupation."""
+        submissions = []
+        if self.submissions_path.exists():
+            with open(self.submissions_path) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line.strip())
+                        if rec.get('occupation', '') == occupation:
+                            submissions.append(rec)
+                    except json.JSONDecodeError:
+                        continue
+        return submissions
+
+    def pre_batch_context(self, attempter=None, occupation=None):
+        """Retrieve historical context before running a batch."""
+        context = {}
+
+        if attempter:
+            profiles = self._load_attempter_profiles()
+            profile = profiles.get(attempter.strip())
+            if profile:
+                context['attempter_risk_tier'] = profile.get('risk_tier', 'UNKNOWN')
+                context['attempter_flag_rate'] = profile.get('flag_rate', 0)
+                context['attempter_total'] = profile.get('total_submissions', 0)
+                context['attempter_confirmed_ai'] = profile.get('confirmed_ai', 0)
+
+        if occupation:
+            subs = self.get_occupation_baselines(occupation)
+            if len(subs) >= 5:
+                cfd_values = [s.get('prompt_signature_cfd', 0) for s in subs]
+                idi_values = [s.get('instruction_density_idi', 0) for s in subs]
+                context['occupation_n'] = len(subs)
+                context['occupation_median_cfd'] = round(
+                    statistics.median(cfd_values), 3)
+                context['occupation_median_idi'] = round(
+                    statistics.median(idi_values), 3)
+
+        return context
+
+    # ── Cross-Batch Similarity ───────────────────────────────────
+
+    def cross_batch_similarity(self, current_results, text_map,
+                               minhash_threshold=0.50):
+        """Compare current batch against historical fingerprints."""
+        historical = []
+        if self.fingerprints_path.exists():
+            with open(self.fingerprints_path) as f:
+                for line in f:
+                    try:
+                        historical.append(json.loads(line.strip()))
+                    except json.JSONDecodeError:
+                        continue
+
+        if not historical:
+            return []
+
+        flags = []
+        for r in current_results:
+            tid = r.get('task_id', '')
+            text = text_map.get(tid, '')
+            if not text:
+                continue
+
+            current_minhash = _minhash_signature(_word_shingles(text))
+
+            for hist in historical:
+                if hist.get('task_id') == tid:
+                    continue
+
+                att_curr = r.get('attempter', '').strip().lower()
+                att_hist = hist.get('attempter', '').strip().lower()
+                if att_curr and att_hist and att_curr == att_hist:
+                    continue
+
+                mh_sim = _minhash_jaccard(
+                    current_minhash, hist.get('minhash_128', []))
+
+                if mh_sim >= minhash_threshold:
+                    flags.append({
+                        'current_id': tid,
+                        'historical_id': hist['task_id'],
+                        'current_attempter': r.get('attempter', ''),
+                        'historical_attempter': hist.get('attempter', ''),
+                        'occupation': r.get('occupation', ''),
+                        'minhash_similarity': round(mh_sim, 3),
+                        'historical_determination': hist.get('determination', '?'),
+                        'historical_batch': hist.get('batch_id', '?'),
+                    })
+
+        flags.sort(key=lambda f: f['minhash_similarity'], reverse=True)
+        return flags
+
+    # ── Confirmation Feedback ────────────────────────────────────
+
+    def record_confirmation(self, task_id, ground_truth, verified_by='',
+                            notes=''):
+        """Record a human-verified ground truth label."""
+        # Find the original submission
+        original = None
+        if self.submissions_path.exists():
+            with open(self.submissions_path) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line.strip())
+                        if rec.get('task_id') == task_id:
+                            original = rec
+                            break
+                    except json.JSONDecodeError:
+                        continue
+
+        record = {
+            'task_id': task_id,
+            'ground_truth': ground_truth,
+            'verified_by': verified_by,
+            'verified_at': datetime.now().isoformat(),
+            'notes': notes,
+        }
+
+        if original:
+            record['attempter'] = original.get('attempter', '')
+            record['occupation'] = original.get('occupation', '')
+            record['pipeline_determination'] = original.get('determination', '')
+            record['pipeline_confidence'] = original.get('confidence', 0)
+
+        with open(self.confirmed_path, 'a') as f:
+            f.write(json.dumps(record, default=str) + '\n')
+
+        # Update attempter profile
+        if original and original.get('attempter'):
+            profiles = self._load_attempter_profiles()
+            att = original['attempter'].strip()
+            if att in profiles:
+                if ground_truth == 'ai':
+                    profiles[att]['confirmed_ai'] = profiles[att].get(
+                        'confirmed_ai', 0) + 1
+                else:
+                    profiles[att]['confirmed_human'] = profiles[att].get(
+                        'confirmed_human', 0) + 1
+                profiles[att]['risk_tier'] = self._compute_risk_tier(profiles[att])
+                self._save_attempter_profiles(profiles)
+
+        self._config['total_confirmed'] = self._config.get(
+            'total_confirmed', 0) + 1
+        self._save_config()
+
+        print(f"  Confirmed: {task_id} = {ground_truth} (by {verified_by})")
+
+    # ── Calibration Integration ──────────────────────────────────
+
+    def rebuild_calibration(self):
+        """Rebuild calibration table from all confirmed human submissions."""
+        confirmed = {}
+        if self.confirmed_path.exists():
+            with open(self.confirmed_path) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line.strip())
+                        confirmed[rec['task_id']] = rec['ground_truth']
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+
+        if not confirmed:
+            print("  No confirmed labels — cannot rebuild calibration")
+            return None
+
+        import tempfile as _tempfile
+        with _tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl',
+                                          delete=False) as tmp:
+            if self.submissions_path.exists():
+                with open(self.submissions_path) as f:
+                    for line in f:
+                        try:
+                            rec = json.loads(line.strip())
+                            tid = rec.get('task_id', '')
+                            if tid in confirmed:
+                                rec['ground_truth'] = confirmed[tid]
+                                tmp.write(json.dumps(rec, default=str) + '\n')
+                        except json.JSONDecodeError:
+                            continue
+            tmp_path = tmp.name
+
+        cal = calibrate_from_baselines(tmp_path)
+        os.unlink(tmp_path)
+
+        if cal is None:
+            print("  Insufficient confirmed human data for calibration")
+            return None
+
+        # Snapshot current calibration before overwriting
+        if self.calibration_path.exists():
+            snapshot_name = f"cal_{datetime.now().strftime('%Y-%m-%d_%H%M')}.json"
+            snapshot_path = self.store_dir / 'calibration_history' / snapshot_name
+            _shutil.copy2(str(self.calibration_path), str(snapshot_path))
+
+        save_calibration(cal, str(self.calibration_path))
+        print(f"  Calibration rebuilt: {cal.get('n_calibration', 0)} labeled samples")
+        return cal
+
+    # ── Summary ──────────────────────────────────────────────────
+
+    def print_summary(self):
+        """Print memory store summary."""
+        c = self._config
+        print(f"\n  BEET Memory Store: {self.store_dir}/")
+        print(f"    Submissions: {c.get('total_submissions', 0)}")
+        print(f"    Batches:     {c.get('total_batches', 0)}")
+        print(f"    Attempters:  {c.get('total_attempters', 0)}")
+        print(f"    Confirmed:   {c.get('total_confirmed', 0)}")
+        occs = c.get('occupations', [])
+        if occs:
+            print(f"    Occupations: {', '.join(occs[:10])}"
+                  f"{'...' if len(occs) > 10 else ''}")
+        print(f"    Last update: {c.get('last_updated', 'never')}")
+
+
+def _print_attempter_history(history):
+    """Print formatted attempter history from memory store."""
+    profile = history.get('profile')
+    if not profile:
+        print("  No history found for this attempter.")
+        return
+
+    print(f"\n  ATTEMPTER: {profile['attempter']}")
+    print(f"    Risk tier:   {profile.get('risk_tier', 'UNKNOWN')}")
+    print(f"    Flag rate:   {profile.get('flag_rate', 0):.0%}")
+    print(f"    Submissions: {profile.get('total_submissions', 0)}")
+
+    dets = profile.get('determinations', {})
+    print(f"    R={dets.get('RED', 0)} A={dets.get('AMBER', 0)} "
+          f"Y={dets.get('YELLOW', 0)} G={dets.get('GREEN', 0)}")
+
+    if profile.get('confirmed_ai', 0) or profile.get('confirmed_human', 0):
+        print(f"    Confirmed: AI={profile.get('confirmed_ai', 0)} "
+              f"Human={profile.get('confirmed_human', 0)}")
+
+    occs = profile.get('occupations', [])
+    if occs:
+        print(f"    Occupations: {', '.join(occs[:5])}")
+
+    print(f"    First seen: {profile.get('first_seen', '?')}")
+    print(f"    Last seen:  {profile.get('last_seen', '?')}")
+    print(f"    Batches:    {len(profile.get('batches', []))}")
+
+    submissions = history.get('submissions', [])
+    if submissions:
+        print(f"\n    Recent submissions (last 10):")
+        for s in submissions[-10:]:
+            print(f"      {s.get('task_id', '?')[:15]:15} "
+                  f"[{s.get('determination', '?'):6}] "
+                  f"conf={s.get('confidence', 0):.2f} "
+                  f"{s.get('occupation', '')[:30]}")
+
+    confirmations = history.get('confirmations', [])
+    if confirmations:
+        print(f"\n    Confirmations ({len(confirmations)}):")
+        for c in confirmations:
+            print(f"      {c.get('task_id', '?')[:15]} = {c.get('ground_truth', '?')} "
+                  f"(by {c.get('verified_by', '?')})")
+
+
+# ==============================================================================
 # ANALYZER: PREAMBLE
 # Preamble detection -- catches LLM output artifacts.
 #
@@ -5673,6 +6261,16 @@ def main():
                         help='Cost per prompt for financial impact estimate (default: $400)')
     parser.add_argument('--html-report', metavar='DIR',
                         help='Generate HTML reports for flagged submissions in DIR')
+    parser.add_argument('--memory', metavar='DIR', default=None,
+                        help='Path to BEET memory store directory (enables cross-batch memory)')
+    parser.add_argument('--confirm', nargs=3, metavar=('TASK_ID', 'LABEL', 'REVIEWER'),
+                        help='Record ground truth confirmation: --confirm task_001 ai reviewer_A')
+    parser.add_argument('--attempter-history', metavar='NAME',
+                        help='Show historical profile for an attempter from memory store')
+    parser.add_argument('--memory-summary', action='store_true',
+                        help='Print memory store summary and exit')
+    parser.add_argument('--rebuild-calibration', action='store_true',
+                        help='Rebuild calibration from confirmed labels in memory store')
     args = parser.parse_args()
 
     if args.gui:
@@ -5682,6 +6280,30 @@ def main():
     if not args.api_key:
         env_key = 'ANTHROPIC_API_KEY' if args.provider == 'anthropic' else 'OPENAI_API_KEY'
         args.api_key = os.environ.get(env_key)
+
+    # Memory store initialization
+    store = None
+    if getattr(args, 'memory', None):
+        store = MemoryStore(args.memory)
+
+    # Standalone memory commands
+    if getattr(args, 'memory_summary', False) and store:
+        store.print_summary()
+        return
+
+    if getattr(args, 'confirm', None) and store:
+        task_id, label, reviewer = args.confirm
+        store.record_confirmation(task_id, label, verified_by=reviewer)
+        return
+
+    if getattr(args, 'attempter_history', None) and store:
+        history = store.get_attempter_history(args.attempter_history)
+        _print_attempter_history(history)
+        return
+
+    if getattr(args, 'rebuild_calibration', False) and store:
+        cal = store.rebuild_calibration()
+        return
 
     if args.analyze_baselines:
         if not os.path.exists(args.analyze_baselines):
@@ -5864,6 +6486,16 @@ def main():
 
     if args.collect:
         collect_baselines(results, args.collect)
+
+    # Memory store: cross-batch similarity + batch recording
+    if store:
+        cross_flags = store.cross_batch_similarity(results, text_map)
+        if cross_flags:
+            print(f"\n  CROSS-BATCH MEMORY: {len(cross_flags)} matches to previous submissions")
+            for cf in cross_flags[:5]:
+                print(f"    {cf['current_id'][:15]} <-> {cf['historical_id'][:15]} "
+                      f"(MH={cf['minhash_similarity']:.2f})")
+        store.record_batch(results, text_map)
 
 
 def main_gui():
